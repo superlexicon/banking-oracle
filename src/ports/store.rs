@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::adapters::ocbc_auth::OcbcSessionTokenRecord;
 use crate::domain::entities::{AccountOwner, BankAccount, Counterparty, MerchantProfile};
 use crate::domain::ledger::{
-    AcquirerClearingItem, BankCreditRecord, EntrySide, LedgerJournalEntry, OnChainOutboxTask,
-    OutboxTaskState, OutboundPaymentTracker, PendingSweepRecord, SubledgerAccountCode,
+    AcquirerClearingItem, BankCreditRecord, DirectCollectionTracker, EntrySide,
+    LedgerJournalEntry, OnChainOutboxTask, OutboxTaskState, OutboundPaymentTracker,
+    PendingSweepRecord, SubledgerAccountCode,
 };
 use crate::domain::money::CurrencyCode;
 use crate::ports::acquirer_adapter::AcquirerPollCursor;
@@ -30,6 +31,8 @@ pub struct StoreSnapshot {
     pub acquirer_poll_cursors: BTreeMap<String, AcquirerPollCursor>,
     pub bank_credits: IndexMap<String, BankCreditRecord>,
     pub outbound_payments: IndexMap<String, OutboundPaymentTracker>,
+    #[serde(default)]
+    pub direct_collections: IndexMap<String, DirectCollectionTracker>,
     pub clearing_items: IndexMap<String, AcquirerClearingItem>,
     pub sweep_batches: IndexMap<String, PendingSweepRecord>,
     pub journals: Vec<LedgerJournalEntry>,

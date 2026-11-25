@@ -18,13 +18,16 @@ use crate::domain::events::{
     OutboundPaymentStatusEvent, VoucherOrderMetadata,
 };
 use crate::domain::ledger::{
-    AcquirerClearingItem, BankCreditRecord, ClearingItemStatus, EntrySide, JournalLine,
-    LedgerJournalEntry, OnChainOutboxTask, OnChainSettlementKind, OutboxTaskState,
-    OutboundPaymentTracker, PendingSweepRecord, SubledgerAccountCode, SweepBatchStatus,
-    SweepMatchMethod,
+    AcquirerClearingItem, BankCreditRecord, ClearingItemStatus, DirectCollectionState,
+    DirectCollectionTracker, EntrySide, JournalLine, LedgerJournalEntry, OnChainOutboxTask,
+    OnChainSettlementKind, OutboxTaskState, OutboundPaymentTracker, PendingSweepRecord,
+    SubledgerAccountCode, SweepBatchStatus, SweepMatchMethod,
 };
 use crate::domain::money::CurrencyCode;
-use crate::ports::bank_adapter::{OutboundPaymentInstruction, OutboundSubmissionReceipt};
+use crate::ports::bank_adapter::{
+    DirectCollectionInstruction, DirectCollectionReceipt, OutboundPaymentInstruction,
+    OutboundSubmissionReceipt,
+};
 use crate::ports::store::{OracleStore, StoreSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +109,17 @@ impl ReconciliationEngine {
                 ));
             }
 
+            let value_date = receipt
+                .value_date
+                .clone()
+                .or_else(|| instruction.value_date.clone())
+                .unwrap_or_else(|| {
+                    chrono::TimeZone::timestamp_opt(&chrono::Utc, now_unix as i64, 0)
+                        .single()
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "2026-11-26".into())
+                });
+
             let tracker = OutboundPaymentTracker {
                 client_instruction_id: instruction.client_instruction_id.clone(),
                 entity_id: acct.owner_entity_id.clone(),
@@ -117,6 +131,9 @@ impl ReconciliationEngine {
                 beneficiary_name: instruction.beneficiary_name.clone(),
                 beneficiary_account: instruction.beneficiary_account.clone(),
                 beneficiary_bank_bic: instruction.beneficiary_bank_bic.clone(),
+                beneficiary_bank_name: instruction.beneficiary_bank_name.clone(),
+                beneficiary_address: instruction.beneficiary_address.clone(),
+                value_date,
                 rail: instruction.rail.clone(),
                 amount: instruction.amount.clone(),
                 bank_fee_minor: 0,
@@ -181,6 +198,65 @@ impl ReconciliationEngine {
                 .get(&instruction.client_instruction_id)
                 .unwrap()
                 .clone())
+        })
+    }
+
+    /// Record an initiated corporate pull collection (e.g. OCBC PayNow UEN Collection `paynowcollection/1.0`)
+    /// so when the corresponding incoming PayNow credit clears on `/ocbc/sg/corp/paynow/1.0` or `corpTransHistory/1.0`,
+    /// it automatically resolves the linked AR invoice or hardware `SLXR` voucher!
+    pub fn record_direct_collection_initiated(
+        &self,
+        account_id: &str,
+        instruction: &DirectCollectionInstruction,
+        receipt: &DirectCollectionReceipt,
+        now_unix: u64,
+    ) -> Result<DirectCollectionTracker> {
+        self.store.write(|s| {
+            let acct = s
+                .bank_accounts
+                .get(account_id)
+                .ok_or_else(|| anyhow!("unknown bank account '{}'", account_id))?
+                .clone();
+            if acct.currency != instruction.amount.currency {
+                return Err(anyhow!(
+                    "collection currency {} does not match bank account '{}' currency {}",
+                    instruction.amount.currency,
+                    acct.account_id,
+                    acct.currency
+                ));
+            }
+            if instruction.amount.amount_minor <= 0 {
+                return Err(anyhow!("collection amount must be positive"));
+            }
+            if s.direct_collections
+                .contains_key(&instruction.transaction_reference_no)
+            {
+                return Err(anyhow!(
+                    "duplicate collection transaction_reference_no '{}'",
+                    instruction.transaction_reference_no
+                ));
+            }
+
+            let tracker = DirectCollectionTracker {
+                transaction_reference_no: instruction.transaction_reference_no.clone(),
+                bank_reference_no: receipt.bank_reference_no.clone(),
+                entity_id: acct.owner_entity_id,
+                account_id: acct.account_id,
+                bank_adapter_id: acct.bank_adapter_id,
+                payer_proxy_type: instruction.payer_proxy_type.clone(),
+                payer_proxy_value: instruction.payer_proxy_value.clone(),
+                dda_reference_no: instruction.dda_reference_no.clone(),
+                purpose_code: instruction.purpose_code.clone(),
+                amount: instruction.amount.clone(),
+                description: instruction.description.clone(),
+                structured_invoice_id: instruction.structured_invoice_id,
+                voucher_metadata: instruction.voucher_metadata.clone(),
+                state: DirectCollectionState::InitiatedAwaitingCredit,
+                created_at_unix: now_unix,
+            };
+            s.direct_collections
+                .insert(tracker.transaction_reference_no.clone(), tracker.clone());
+            Ok(tracker)
         })
     }
 
@@ -294,7 +370,7 @@ impl ReconciliationEngine {
     fn apply_bank_credit_locked(
         &self,
         s: &mut StoreSnapshot,
-        credit: AppliedCreditEvent,
+        mut credit: AppliedCreditEvent,
         now_unix: u64,
     ) -> Result<IngestOutcome> {
         if credit.amount.amount_minor <= 0 {
@@ -312,6 +388,59 @@ impl ReconciliationEngine {
         );
         if s.bank_credits.contains_key(&credit_key) {
             return Ok(IngestOutcome::DuplicateIgnored { key: credit_key });
+        }
+
+        // Enrich credit from a matching initiated `DirectCollectionTracker` (e.g. OCBC `paynowcollection/1.0`)
+        // when the PayNow enquiry `/ocbc/sg/corp/paynow/1.0` returns `{ AccountCurrency, AccountNo, Amount, CreditDebitIndicator }`:
+        let matched_collection_ref = {
+            let rem_upper = credit.remittance_info.to_ascii_uppercase();
+            let tx_upper = credit.bank_tx_id.to_ascii_uppercase();
+            let open_candidates: Vec<&DirectCollectionTracker> = s
+                .direct_collections
+                .values()
+                .filter(|dc| {
+                    dc.state == DirectCollectionState::InitiatedAwaitingCredit
+                        && dc.account_id == acct.account_id
+                        && dc.amount == credit.amount
+                })
+                .collect();
+
+            let by_ref = open_candidates.iter().find(|dc| {
+                let tref = dc.transaction_reference_no.to_ascii_uppercase();
+                let bref = dc.bank_reference_no.to_ascii_uppercase();
+                (!tref.is_empty() && (rem_upper.contains(&tref) || tx_upper.contains(&tref)))
+                    || (!bref.is_empty() && (rem_upper.contains(&bref) || tx_upper.contains(&bref)))
+            });
+
+            if let Some(found) = by_ref {
+                Some(found.transaction_reference_no.clone())
+            } else if open_candidates.len() == 1
+                && credit.structured_invoice_id.is_none()
+                && credit.voucher_metadata.is_none()
+                && credit.batch_or_sweep_ref.is_none()
+            {
+                Some(open_candidates[0].transaction_reference_no.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(col_key) = matched_collection_ref {
+            if let Some(dc) = s.direct_collections.get_mut(&col_key) {
+                if credit.structured_invoice_id.is_none() {
+                    credit.structured_invoice_id = dc.structured_invoice_id;
+                }
+                if credit.voucher_metadata.is_none() {
+                    credit.voucher_metadata = dc.voucher_metadata.clone();
+                }
+                if credit.remittance_info.is_empty() {
+                    credit.remittance_info = dc.description.clone();
+                }
+                dc.state = DirectCollectionState::SettledByBankCredit {
+                    credit_key: credit_key.clone(),
+                    settled_at_unix: now_unix,
+                };
+            }
         }
 
         let owner = s

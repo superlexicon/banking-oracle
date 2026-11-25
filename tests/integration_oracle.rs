@@ -254,11 +254,10 @@ fn setup_multi_entity_harness() -> TestHarness {
             client_id: "cid_corp".into(),
             redirect_uri: "https://oracle.superlexicon.io/v1/oauth/ocbc/callback".into(),
             default_access_token: Some("3f86faa0f22934789b71b79ac39ec34f".into()),
+            paynow_partner_id: None,
             webhook_secret: "whsec_ocbc_corp_test".into(),
             max_webhook_skew_secs: 300,
             max_calls_per_minute: 10,
-            outbound_initiation_path: None,
-            outbound_inquiry_path: None,
         },
         transport.clone(),
         ocbc_token_vault.clone(),
@@ -862,6 +861,9 @@ async fn stripe_periodical_sweep_with_pre_sweep_refund_and_outbound_payment_poll
             beneficiary_name: "Murata Electronics SG".into(),
             beneficiary_account: "003-998877-1".into(),
             beneficiary_bank_bic: Some("DBSSSGSG".into()),
+            beneficiary_bank_name: None,
+            beneficiary_address: None,
+            value_date: None,
             rail: TransferRail::Fast,
             amount: Money::new(20_000, CurrencyCode::sgd()), // SGD 200.00
             remittance_info: "PO-RF-SAW-FILTERS".into(),
@@ -1169,6 +1171,9 @@ async fn cross_currency_usd_card_into_sgd_sweep_jws_webhook_dedup_and_post_final
                 beneficiary_name: "Bad Acct Vendor".into(),
                 beneficiary_account: "999-000".into(),
                 beneficiary_bank_bic: None,
+                beneficiary_bank_name: None,
+                beneficiary_address: None,
+                value_date: None,
                 rail: TransferRail::Fast,
                 amount: Money::new(10_000, CurrencyCode::sgd()),
                 remittance_info: "TEST-RJCT".into(),
@@ -1176,6 +1181,7 @@ async fn cross_currency_usd_card_into_sgd_sweep_jws_webhook_dedup_and_post_final
             &banking_oracle::ports::bank_adapter::OutboundSubmissionReceipt {
                 bank_payment_id: Some("OCBC-PAY-RJ1".into()),
                 end_to_end_id: None,
+                value_date: None,
                 initial_state: OutboundPaymentState::InProcessing,
             },
             now + 600,
@@ -1443,5 +1449,305 @@ async fn official_ocbc_oauth_fragment_authorize_capture_void_query_and_10rpm_rat
     assert!(
         limiter.acquire_slot("tok_user_1", 1061).await.is_ok(),
         "Call at t+61s succeeds once oldest slot slides out of the 60s window"
+    );
+}
+
+#[tokio::test]
+async fn official_ocbc_meps_initiation_status_polling_and_paynow_uen_collection_enquiry() {
+    use banking_oracle::adapters::ocbc_auth::{OcbcRateLimiter, OcbcTokenVault};
+    use banking_oracle::domain::events::OutboundPaymentState;
+    use banking_oracle::domain::ledger::DirectCollectionState;
+    use banking_oracle::ports::bank_adapter::{AccountPollCursor, DirectCollectionInstruction};
+
+    let transport = Arc::new(MockHttpTransport::new());
+    let store = Arc::new(OracleStore::in_memory());
+
+    let mut slx_ledgers = BTreeMap::new();
+    slx_ledgers.insert(
+        CurrencyCode::sgd(),
+        "0xa1000000000000000000000000000000000000a1".into(),
+    );
+    store
+        .upsert_entity(AccountOwner {
+            entity_id: "ent_slx_meps".into(),
+            legal_name: "SuperLexicon Pte. Ltd.".into(),
+            registration_number: "202600101A".into(),
+            functional_currency: CurrencyCode::sgd(),
+            active: true,
+            chain_binding: Some(EntityChainBinding {
+                oracle_private_key_hex: "11".repeat(32),
+                chain_id: 1337,
+                wire_format: TxWireFormat::SuperLexiconL1,
+                treasury_identity_hex: Some(
+                    "0x1000000000000000000000000000000000000010".into(),
+                ),
+                operating_bank_ledgers: slx_ledgers,
+                ifrs_accounting_ledger_hex: Some(
+                    "0xb1000000000000000000000000000000000000b1".into(),
+                ),
+                reward_voucher_hfs_hex: Some(
+                    "0xd5000000000000000000000000000000000000d5".into(),
+                ),
+                fx_to_usd_ppm: BTreeMap::new(),
+            }),
+        })
+        .unwrap();
+
+    let ocbc_acct = BankAccount {
+        account_id: "acct_ocbc_sgd".into(),
+        owner_entity_id: "ent_slx_meps".into(),
+        bank_adapter_id: "ocbc_corporate".into(),
+        bank_bic: "OCBCSGSG".into(),
+        external_account_number: "501-889900-001".into(),
+        currency: CurrencyCode::sgd(),
+        display_name: "OCBC SGD CASA".into(),
+        poll_enabled: true,
+        poll_interval_secs: 60,
+    };
+    store.upsert_bank_account(ocbc_acct.clone()).unwrap();
+
+    let vault = Arc::new(OcbcTokenVault::new(
+        store.clone(),
+        Some("489efb0ee095e75d625ccc0fa5f23e30".into()),
+    ));
+    let limiter = Arc::new(OcbcRateLimiter::new(10));
+    let adapter = OcbcCorporateBankAdapter::new(
+        OcbcCorporateConfig {
+            adapter_id: "ocbc_corporate".into(),
+            base_url: "https://mock.ocbc.local".into(),
+            client_id: "cid_ocbc".into(),
+            redirect_uri: "https://oracle.superlexicon.io/v1/oauth/ocbc/callback".into(),
+            default_access_token: Some("489efb0ee095e75d625ccc0fa5f23e30".into()),
+            paynow_partner_id: Some("PARTNER_SLX_SG".into()),
+            webhook_secret: "whsec_ocbc".into(),
+            max_webhook_skew_secs: 300,
+            max_calls_per_minute: 10,
+        },
+        transport.clone(),
+        vault,
+        limiter,
+    );
+    let engine = ReconciliationEngine::new(store.clone(), b"salt-meps-paynow".to_vec());
+    let now = 1_795_800_000u64;
+
+    // 1. Test Corporate PayNow Collection via UEN (`POST /transactional/corporate/paynowcollection/1.0`)
+    //    Notice OCBC returns `Success: "true"` (string!) and singular `Result: { OCBCReferenceNo, TransactionReferenceNo }`!
+    transport.enqueue_json(
+        "mock.ocbc.local/transactional/corporate/paynowcollection/1.0",
+        200,
+        json!({
+            "Disclaimer": "OCBC Sandbox",
+            "Success": "true",
+            "Result": {
+                "TransactionDescription": "Enterprise Gateway Invoice #7701",
+                "OCBCReferenceNo": "OCBCPAYNOW99001",
+                "TransactionReferenceNo": "SLXCOLL7701"
+            }
+        }),
+    );
+
+    let col_instr = DirectCollectionInstruction {
+        transaction_reference_no: "SLXCOLL7701".into(),
+        payer_proxy_type: "UEN".into(),
+        payer_proxy_value: "T01LL8899A".into(),
+        dda_reference_no: "DDA-2026-8899".into(),
+        purpose_code: "GDSV".into(),
+        amount: Money::new(49_900, CurrencyCode::sgd()), // SGD 499.00
+        description: "Enterprise Gateway Invoice #7701".into(),
+        structured_invoice_id: Some(7701),
+        voucher_metadata: None,
+    };
+    let col_receipt = adapter
+        .initiate_direct_collection(&ocbc_acct, &col_instr, now)
+        .await
+        .unwrap();
+    assert_eq!(col_receipt.bank_reference_no, "OCBCPAYNOW99001");
+    engine
+        .record_direct_collection_initiated("acct_ocbc_sgd", &col_instr, &col_receipt, now)
+        .unwrap();
+
+    // Verify exact `paynowcollection/1.0` JSON payload (`Amount` as double `499.0`, `ProxyType: "UEN"`, `FromAccountNo`)
+    let col_req_raw: serde_json::Value =
+        serde_json::from_slice(&transport.recorded_requests()[0].body).unwrap();
+    assert_eq!(col_req_raw["Amount"], json!(499.0));
+    assert_eq!(col_req_raw["ProxyType"], "UEN");
+    assert_eq!(col_req_raw["ProxyValue"], "T01LL8899A");
+    assert_eq!(col_req_raw["DDAReferenceNo"], "DDA-2026-8899");
+
+    // 2. Poll incoming transactions -> executes BOTH `GET /transactional/corpTransHistory/1.0` AND `POST /ocbc/sg/corp/paynow/1.0`!
+    transport.enqueue_json(
+        "mock.ocbc.local/transactional/corpTransHistory/1.0",
+        200,
+        json!({ "success": true, "results": [] }),
+    );
+    transport.enqueue_json(
+        "mock.ocbc.local/ocbc/sg/corp/paynow/1.0",
+        200,
+        json!({
+            "Transactions": [
+                {
+                    "AccountCurrency": "SGD",
+                    "AccountNo": 501889900001.0,
+                    "Amount": 499.00,
+                    "CreditDebitIndicator": "C"
+                }
+            ]
+        }),
+    );
+
+    let poll_batch = adapter
+        .poll_incoming_transactions(&ocbc_acct, &AccountPollCursor::default(), now + 30)
+        .await
+        .unwrap();
+    assert_eq!(poll_batch.applied_credits.len(), 1);
+
+    // Verify PayNow Enquiry sent `AccountNo` as numeric JSON (`501889900001.0`) and `PartnerID: "PARTNER_SLX_SG"`!
+    let pn_req_raw: serde_json::Value =
+        serde_json::from_slice(&transport.recorded_requests()[2].body).unwrap();
+    assert_eq!(pn_req_raw["PartnerID"], "PARTNER_SLX_SG");
+    assert!(pn_req_raw["AccountNo"].is_number());
+
+    // Ingesting the PayNow credit automatically matches `DirectCollectionTracker("SLXCOLL7701")` and settles Invoice `#7701`!
+    for cr in poll_batch.applied_credits {
+        engine
+            .ingest_bank_event(
+                banking_oracle::domain::events::CanonicalBankEvent::AppliedCredit(cr),
+                now + 30,
+            )
+            .unwrap();
+    }
+    store.read(|s| {
+        assert!(matches!(
+            s.direct_collections["SLXCOLL7701"].state,
+            DirectCollectionState::SettledByBankCredit { .. }
+        ));
+    });
+    let has_inv_settle = store.pending_outbox_tasks().iter().any(|t| {
+        matches!(
+            t.action,
+            OnChainSettlementKind::SettleIfrsCreditInvoice {
+                invoice_id: 7701,
+                amount_micros: 499_000_000,
+                ..
+            }
+        )
+    });
+    assert!(has_inv_settle, "PayNow UEN collection credit must auto-settle linked Invoice #7701");
+
+    // 3. Test Perform MEPS Payment (`POST /transactional/corp/payment/meps/1.0`) -> Status Inquiry (`POST /corp/payment/meps/1.0`)!
+    transport.enqueue_json(
+        "mock.ocbc.local/transactional/corp/payment/meps/1.0",
+        200,
+        json!({
+            "ReferenceText": "MEPS2026SUP88",
+            "Success": true,
+            "Disclaimer": "OCBC Sandbox",
+            "Results": {
+                "BankPaymentId": "OCBCMEPS000991"
+            }
+        }),
+    );
+
+    let meps_instr = OutboundPaymentInstruction {
+        client_instruction_id: "MEPS-2026-SUP-88".into(), // sanitized to alphanumeric `MEPS2026SUP88`
+        counterparty_id: None,
+        beneficiary_name: "STMicroelectronics Asia Pacific".into(),
+        beneficiary_account: "0012345678".into(),
+        beneficiary_bank_bic: Some("DBSSSGSG".into()),
+        beneficiary_bank_name: Some("DBS Bank Ltd".into()),
+        beneficiary_address: Some("5A Serangoon North Ave 5, Singapore".into()),
+        value_date: Some("26-11-2026".into()),
+        rail: TransferRail::MepsPlus,
+        amount: Money::new(15_000, CurrencyCode::sgd()), // SGD 150.00
+        remittance_info: "MCU WAFER TRAY LOT".into(),
+    };
+    let meps_receipt = adapter
+        .initiate_outbound_payment(&ocbc_acct, &meps_instr, now + 40)
+        .await
+        .unwrap();
+    assert_eq!(
+        meps_receipt.bank_payment_id.as_deref(),
+        Some("OCBCMEPS000991")
+    );
+    let mut tracker = engine
+        .record_outbound_initiated("acct_ocbc_sgd", &meps_instr, &meps_receipt, now + 40)
+        .unwrap();
+    assert_eq!(tracker.state, OutboundPaymentState::AcceptedByBank);
+
+    // Verify exact MEPS initiation JSON structure (`Payer`, `Payee.Address.Address`, `Amount.Value`, alphanumeric `ReferenceText`)
+    let meps_init_json: serde_json::Value =
+        serde_json::from_slice(&transport.recorded_requests()[3].body).unwrap();
+    assert_eq!(meps_init_json["ReferenceText"], "MEPS2026SUP88");
+    assert_eq!(meps_init_json["Payer"]["SwiftCode"], "OCBCSGSG");
+    assert_eq!(
+        meps_init_json["Payee"]["Address"]["Address"],
+        "5A Serangoon North Ave 5, Singapore"
+    );
+    assert_eq!(meps_init_json["Amount"]["Value"], "150.00");
+
+    // Poll #1 on `POST /corp/payment/meps/1.0` -> `PROCESSING`
+    transport.enqueue_json(
+        "mock.ocbc.local/corp/payment/meps/1.0",
+        200,
+        json!({
+            "ReferenceText": "MEPS2026SUP88",
+            "Success": true,
+            "Results": {
+                "BankPaymentId": "OCBCMEPS000991",
+                "PaymentStatus": "PROCESSING",
+                "UpdateDateTime": "26-11-2026 09:01:00",
+                "ActualValueDate": "26-11-2026",
+                "Amount": { "Currency": "SGD", "Value": "150.00" }
+            }
+        }),
+    );
+    let st1 = adapter
+        .poll_outbound_payment_status(&ocbc_acct, &tracker, now + 50)
+        .await
+        .unwrap();
+    assert_eq!(st1.state, OutboundPaymentState::InProcessing);
+    engine
+        .ingest_bank_event(
+            banking_oracle::domain::events::CanonicalBankEvent::OutboundStatusChanged(st1),
+            now + 50,
+        )
+        .unwrap();
+    tracker.state = OutboundPaymentState::InProcessing;
+
+    // Poll #2 on `POST /corp/payment/meps/1.0` -> `COMPLETED` (`Settled` -> burns SGD 150.00 operating cash on-chain!)
+    transport.enqueue_json(
+        "mock.ocbc.local/corp/payment/meps/1.0",
+        200,
+        json!({
+            "ReferenceText": "MEPS2026SUP88",
+            "Success": true,
+            "Results": {
+                "BankPaymentId": "OCBCMEPS000991",
+                "PaymentStatus": "COMPLETED",
+                "UpdateDateTime": "26-11-2026 09:02:15",
+                "ActualValueDate": "26-11-2026",
+                "Amount": { "Currency": "SGD", "Value": "150.00" }
+            }
+        }),
+    );
+    let st2 = adapter
+        .poll_outbound_payment_status(&ocbc_acct, &tracker, now + 60)
+        .await
+        .unwrap();
+    assert_eq!(st2.state, OutboundPaymentState::Settled);
+    engine
+        .ingest_bank_event(
+            banking_oracle::domain::events::CanonicalBankEvent::OutboundStatusChanged(st2),
+            now + 60,
+        )
+        .unwrap();
+
+    assert_entity_trial_balance_zero_net(&store, "ent_slx_meps");
+    let tb = store.compute_entity_trial_balance("ent_slx_meps");
+    // Net Cash at Bank = 499.00 (PayNow in) - 150.00 (MEPS settled out) = 349.00 (`34_900` cents)!
+    assert_eq!(
+        tb[&CurrencyCode::sgd()][&SubledgerAccountCode::CashAtBank1010]
+            .net_debit_minus_credit_minor,
+        34_900
     );
 }

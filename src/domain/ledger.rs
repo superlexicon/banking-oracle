@@ -223,6 +223,13 @@ pub struct OutboundPaymentTracker {
     pub beneficiary_name: String,
     pub beneficiary_account: String,
     pub beneficiary_bank_bic: Option<String>,
+    #[serde(default)]
+    pub beneficiary_bank_name: Option<String>,
+    #[serde(default)]
+    pub beneficiary_address: Option<String>,
+    /// Original value date (`ValueDate`) required by status inquiry endpoints such as OCBC MEPS `/corp/payment/meps/1.0`.
+    #[serde(default)]
+    pub value_date: String,
     pub rail: TransferRail,
     pub amount: Money,
     pub bank_fee_minor: i128,
@@ -232,6 +239,38 @@ pub struct OutboundPaymentTracker {
     pub last_reason_detail: Option<String>,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DirectCollectionState {
+    InitiatedAwaitingCredit,
+    SettledByBankCredit {
+        credit_key: String,
+        settled_at_unix: u64,
+    },
+}
+
+/// Persistent tracker for an initiated corporate pull collection (e.g. OCBC Corporate PayNow UEN Collection
+/// `POST /transactional/corporate/paynowcollection/1.0`), awaiting actual finalized bank credit confirmation
+/// via `/ocbc/sg/corp/paynow/1.0`, `corpTransHistory/1.0`, or credit webhook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectCollectionTracker {
+    pub transaction_reference_no: String,
+    pub bank_reference_no: String,
+    pub entity_id: String,
+    pub account_id: String,
+    pub bank_adapter_id: String,
+    pub payer_proxy_type: String,
+    pub payer_proxy_value: String,
+    pub dda_reference_no: String,
+    pub purpose_code: String,
+    pub amount: Money,
+    pub description: String,
+    pub structured_invoice_id: Option<u64>,
+    pub voucher_metadata: Option<VoucherOrderMetadata>,
+    pub state: DirectCollectionState,
+    pub created_at_unix: u64,
 }
 
 /// Target HFS action queued in the transactional outbox ONLY after bank-level finality (or verified revocation).

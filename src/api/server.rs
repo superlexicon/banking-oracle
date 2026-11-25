@@ -42,7 +42,9 @@ use crate::engine::chain_relayer::ChainOutboxRelayer;
 use crate::engine::poller::PollingSupervisor;
 use crate::engine::reconciliation::ReconciliationEngine;
 use crate::ports::acquirer_adapter::{MerchantPaymentRequest, PaymentAcquirerAdapter};
-use crate::ports::bank_adapter::{BankTechnicalAdapter, OutboundPaymentInstruction};
+use crate::ports::bank_adapter::{
+    BankTechnicalAdapter, DirectCollectionInstruction, OutboundPaymentInstruction,
+};
 
 pub struct OracleApiState {
     pub engine: Arc<ReconciliationEngine>,
@@ -61,6 +63,12 @@ pub struct OracleApiState {
 pub struct InitiateOutboundApiRequest {
     pub account_id: String,
     pub instruction: OutboundPaymentInstruction,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InitiateDirectCollectionApiRequest {
+    pub account_id: String,
+    pub instruction: DirectCollectionInstruction,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -151,6 +159,10 @@ pub fn build_oracle_router(state: Arc<OracleApiState>) -> Router {
         )
         .route("/v1/counterparties", post(handle_upsert_counterparty))
         .route("/v1/payments/outbound", post(handle_initiate_outbound))
+        .route(
+            "/v1/collections/direct",
+            post(handle_initiate_direct_collection),
+        )
         .route(
             "/v1/payments/merchant/sessions",
             post(handle_create_merchant_session),
@@ -576,6 +588,64 @@ async fn handle_initiate_outbound(
     }
 }
 
+async fn handle_initiate_direct_collection(
+    State(st): State<Arc<OracleApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<InitiateDirectCollectionApiRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(resp) = check_admin_auth(&headers, &st.admin_bearer_token) {
+        return resp;
+    }
+    let Some(acct) = st
+        .engine
+        .store()
+        .read(|s| s.bank_accounts.get(&req.account_id).cloned())
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown bank account '{}'", req.account_id) })),
+        );
+    };
+    let Some(adapter) = st.bank_adapters.get(&acct.bank_adapter_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("missing adapter '{}'", acct.bank_adapter_id) })),
+        );
+    };
+
+    let now = unix_now();
+    let receipt = match adapter
+        .initiate_direct_collection(&acct, &req.instruction, now)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+        }
+    };
+
+    match st
+        .engine
+        .record_direct_collection_initiated(&acct.account_id, &req.instruction, &receipt, now)
+    {
+        Ok(tracker) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "collection_initiated",
+                "receipt": receipt,
+                "tracker": tracker,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
 async fn handle_create_merchant_session(
     State(st): State<Arc<OracleApiState>>,
     headers: HeaderMap,
@@ -787,6 +857,7 @@ async fn handle_reconciliation_state(
         json!({
             "bankCredits": s.bank_credits,
             "outboundPayments": s.outbound_payments,
+            "directCollections": s.direct_collections,
             "clearingItems": s.clearing_items,
             "sweepBatches": s.sweep_batches,
             "journals": s.journals,

@@ -369,6 +369,7 @@ impl BankTechnicalAdapter for Iso20022BankAdapter {
         Ok(OutboundSubmissionReceipt {
             bank_payment_id: val["StsId"].as_str().map(String::from),
             end_to_end_id: val["EndToEndId"].as_str().map(String::from),
+            value_date: instruction.value_date.clone(),
             initial_state: Self::map_pain002_status(val["TxSts"].as_str().unwrap_or("ACCP"))?,
         })
     }

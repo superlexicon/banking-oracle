@@ -12,11 +12,10 @@
     "client_id": "CONNECT2OCBC_CONSUMER_KEY",
     "redirect_uri": "https://oracle.superlexicon.io/v1/oauth/ocbc/callback",
     "default_access_token": null,
+    "paynow_partner_id": "OCBC_PAYNOW_PARTNER_ID",
     "webhook_secret": "OCBC_CREDIT_AND_STATUS_WEBHOOK_SECRET",
     "max_webhook_skew_secs": 300,
-    "max_calls_per_minute": 10,
-    "outbound_initiation_path": null,
-    "outbound_inquiry_path": null
+    "max_calls_per_minute": 10
   },
   "iso20022_banks": [
     {
