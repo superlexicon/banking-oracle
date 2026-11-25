@@ -1,0 +1,6 @@
+/target
+/*.db
+/*.jsonl
+/*.snap.json
+.env
+.DS_Store

@@ -1,0 +1,21 @@
+[Unit]
+Description=SuperLexicon Multi-Bank & Payment Acquiring Oracle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=banking-oracle
+Group=banking-oracle
+WorkingDirectory=/var/lib/banking-oracle
+ExecStart=/usr/local/bin/banking-oracle --config=/etc/banking-oracle/config.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/banking-oracle
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,146 @@
+{
+  "listen_addr": "127.0.0.1:9088",
+  "state_file_path": "/var/lib/banking-oracle/state.snap.json",
+  "l1_rpc_url": "http://127.0.0.1:8545",
+  "domain_salt": "replace-with-32byte-production-domain-salt",
+  "admin_bearer_token": "replace-with-high-entropy-admin-token",
+  "poll_interval_secs": 30,
+  "outbox_flush_interval_secs": 5,
+  "ocbc_corporate": {
+    "adapter_id": "ocbc_corporate",
+    "base_url": "https://api.ocbc.com",
+    "client_id": "CONNECT2OCBC_CORP_CLIENT_ID",
+    "client_secret": "CONNECT2OCBC_CORP_CLIENT_SECRET",
+    "webhook_secret": "OCBC_CREDIT_AND_STATUS_WEBHOOK_SECRET",
+    "max_webhook_skew_secs": 300
+  },
+  "iso20022_banks": [
+    {
+      "adapter_id": "iso20022_dbs",
+      "bank_name": "DBS Bank (RAPID ISO 20022)",
+      "base_url": "https://enterprise-api.dbs.com",
+      "bearer_or_api_key": "DBS_RAPID_BEARER_TOKEN",
+      "webhook_secret": "DBS_CAMT054_PAIN002_SECRET",
+      "max_webhook_skew_secs": 300
+    }
+  ],
+  "ocbc_merchant_card": {
+    "acquirer_id": "ocbc_merchant_card",
+    "base_url": "https://api.ocbc.com",
+    "client_id": "CONNECT2OCBC_MERCHANT_CARD_CLIENT_ID",
+    "client_secret": "CONNECT2OCBC_MERCHANT_CARD_SECRET",
+    "webhook_secret": "OCBC_MERCHANT_CARD_WEBHOOK_SECRET",
+    "max_webhook_skew_secs": 300
+  },
+  "stripe": {
+    "acquirer_id": "stripe",
+    "base_url": "https://api.stripe.com",
+    "secret_api_key": "sk_live_replace_me",
+    "webhook_secret": "whsec_replace_me",
+    "default_account_id": "acct_superlexicon_sg",
+    "max_webhook_skew_secs": 300
+  },
+  "bootstrap_entities": [
+    {
+      "entity_id": "ent_superlexicon_sg",
+      "legal_name": "SuperLexicon Pte. Ltd.",
+      "registration_number": "202600101A",
+      "functional_currency": "SGD",
+      "active": true,
+      "chain_binding": {
+        "oracle_private_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "chain_id": 1337,
+        "wire_format": "super_lexicon_l1",
+        "treasury_identity_hex": "0x1000000000000000000000000000000000000010",
+        "operating_bank_ledgers": {
+          "SGD": "0xa1000000000000000000000000000000000000a1",
+          "USD": "0xa2000000000000000000000000000000000000a2"
+        },
+        "ifrs_accounting_ledger_hex": "0xb1000000000000000000000000000000000000b1",
+        "reward_voucher_hfs_hex": "0xd5000000000000000000000000000000000000d5",
+        "fx_to_usd_ppm": {
+          "SGD": 745000
+        }
+      }
+    },
+    {
+      "entity_id": "ent_immin_io",
+      "legal_name": "immin Pte. Ltd.",
+      "registration_number": "202300882K",
+      "functional_currency": "SGD",
+      "active": true,
+      "chain_binding": {
+        "oracle_private_key_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+        "chain_id": 1337,
+        "wire_format": "super_lexicon_l1",
+        "treasury_identity_hex": "0x2000000000000000000000000000000000000020",
+        "operating_bank_ledgers": {
+          "SGD": "0xa1000000000000000000000000000000000000a1"
+        },
+        "ifrs_accounting_ledger_hex": "0xb2000000000000000000000000000000000000b2",
+        "reward_voucher_hfs_hex": null,
+        "fx_to_usd_ppm": {}
+      }
+    }
+  ],
+  "bootstrap_bank_accounts": [
+    {
+      "account_id": "acct_slx_ocbc_sgd",
+      "owner_entity_id": "ent_superlexicon_sg",
+      "bank_adapter_id": "ocbc_corporate",
+      "bank_bic": "OCBCSGSG",
+      "external_account_number": "501-889900-001",
+      "currency": "SGD",
+      "display_name": "SuperLexicon OCBC SGD Operating CASA",
+      "poll_enabled": true,
+      "poll_interval_secs": 60
+    },
+    {
+      "account_id": "acct_slx_ocbc_usd",
+      "owner_entity_id": "ent_superlexicon_sg",
+      "bank_adapter_id": "ocbc_corporate",
+      "bank_bic": "OCBCSGSG",
+      "external_account_number": "501-889900-840",
+      "currency": "USD",
+      "display_name": "SuperLexicon OCBC USD Treasury MCA",
+      "poll_enabled": true,
+      "poll_interval_secs": 60
+    },
+    {
+      "account_id": "acct_immin_dbs_sgd",
+      "owner_entity_id": "ent_immin_io",
+      "bank_adapter_id": "iso20022_dbs",
+      "bank_bic": "DBSSSGSG",
+      "external_account_number": "072-112233-0",
+      "currency": "SGD",
+      "display_name": "immin DBS SGD Operating Account",
+      "poll_enabled": true,
+      "poll_interval_secs": 60
+    }
+  ],
+  "bootstrap_merchant_profiles": [
+    {
+      "merchant_profile_id": "mch_slx_ocbc_card",
+      "owner_entity_id": "ent_superlexicon_sg",
+      "acquirer_adapter_id": "ocbc_merchant_card",
+      "external_merchant_id": "OCBCMID8899001",
+      "settlement_bank_account_id": "acct_slx_ocbc_sgd",
+      "settlement_currency": "SGD",
+      "accepted_currencies": ["SGD", "USD"],
+      "poll_enabled": true,
+      "poll_interval_secs": 120
+    },
+    {
+      "merchant_profile_id": "mch_slx_stripe",
+      "owner_entity_id": "ent_superlexicon_sg",
+      "acquirer_adapter_id": "stripe",
+      "external_merchant_id": "acct_superlexicon_sg",
+      "settlement_bank_account_id": "acct_slx_ocbc_sgd",
+      "settlement_currency": "SGD",
+      "accepted_currencies": ["SGD", "USD", "EUR"],
+      "poll_enabled": true,
+      "poll_interval_secs": 120
+    }
+  ],
+  "bootstrap_counterparties": []
+}
