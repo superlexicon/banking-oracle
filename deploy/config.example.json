@@ -9,10 +9,14 @@
   "ocbc_corporate": {
     "adapter_id": "ocbc_corporate",
     "base_url": "https://api.ocbc.com",
-    "client_id": "CONNECT2OCBC_CORP_CLIENT_ID",
-    "client_secret": "CONNECT2OCBC_CORP_CLIENT_SECRET",
+    "client_id": "CONNECT2OCBC_CONSUMER_KEY",
+    "redirect_uri": "https://oracle.superlexicon.io/v1/oauth/ocbc/callback",
+    "default_access_token": null,
     "webhook_secret": "OCBC_CREDIT_AND_STATUS_WEBHOOK_SECRET",
-    "max_webhook_skew_secs": 300
+    "max_webhook_skew_secs": 300,
+    "max_calls_per_minute": 10,
+    "outbound_initiation_path": null,
+    "outbound_inquiry_path": null
   },
   "iso20022_banks": [
     {
@@ -27,10 +31,10 @@
   "ocbc_merchant_card": {
     "acquirer_id": "ocbc_merchant_card",
     "base_url": "https://api.ocbc.com",
-    "client_id": "CONNECT2OCBC_MERCHANT_CARD_CLIENT_ID",
-    "client_secret": "CONNECT2OCBC_MERCHANT_CARD_SECRET",
-    "webhook_secret": "OCBC_MERCHANT_CARD_WEBHOOK_SECRET",
-    "max_webhook_skew_secs": 300
+    "txn_signature_secret": "OCBC_MERCHANT_TXN_SIGNATURE_SECRET",
+    "enforce_response_signature": true,
+    "max_webhook_skew_secs": 300,
+    "default_mdr_bps": 200
   },
   "stripe": {
     "acquirer_id": "stripe",
@@ -62,25 +66,6 @@
           "SGD": 745000
         }
       }
-    },
-    {
-      "entity_id": "ent_immin_io",
-      "legal_name": "immin Pte. Ltd.",
-      "registration_number": "202300882K",
-      "functional_currency": "SGD",
-      "active": true,
-      "chain_binding": {
-        "oracle_private_key_hex": "2222222222222222222222222222222222222222222222222222222222222222",
-        "chain_id": 1337,
-        "wire_format": "super_lexicon_l1",
-        "treasury_identity_hex": "0x2000000000000000000000000000000000000020",
-        "operating_bank_ledgers": {
-          "SGD": "0xa1000000000000000000000000000000000000a1"
-        },
-        "ifrs_accounting_ledger_hex": "0xb2000000000000000000000000000000000000b2",
-        "reward_voucher_hfs_hex": null,
-        "fx_to_usd_ppm": {}
-      }
     }
   ],
   "bootstrap_bank_accounts": [
@@ -103,17 +88,6 @@
       "external_account_number": "501-889900-840",
       "currency": "USD",
       "display_name": "SuperLexicon OCBC USD Treasury MCA",
-      "poll_enabled": true,
-      "poll_interval_secs": 60
-    },
-    {
-      "account_id": "acct_immin_dbs_sgd",
-      "owner_entity_id": "ent_immin_io",
-      "bank_adapter_id": "iso20022_dbs",
-      "bank_bic": "DBSSSGSG",
-      "external_account_number": "072-112233-0",
-      "currency": "SGD",
-      "display_name": "immin DBS SGD Operating Account",
       "poll_enabled": true,
       "poll_interval_secs": 60
     }

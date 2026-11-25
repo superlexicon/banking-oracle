@@ -16,6 +16,7 @@ use banking_oracle::adapters::acquirers::{
 use banking_oracle::adapters::banks::{
     Iso20022BankAdapter, Iso20022BankConfig, OcbcCorporateBankAdapter, OcbcCorporateConfig,
 };
+use banking_oracle::adapters::ocbc_auth::{OcbcRateLimiter, OcbcTokenVault};
 use banking_oracle::api::{build_oracle_router, OracleApiState};
 use banking_oracle::domain::entities::{
     AccountOwner, BankAccount, Counterparty, MerchantProfile,
@@ -123,10 +124,23 @@ async fn main() -> Result<()> {
         store.upsert_counterparty(cp)?;
     }
 
+    let ocbc_token_vault = Arc::new(OcbcTokenVault::new(
+        store.clone(),
+        cfg.ocbc_corporate
+            .default_access_token
+            .clone()
+            .or_else(|| std::env::var("OCBC_ACCESS_TOKEN").ok()),
+    ));
+    let ocbc_rate_limiter = Arc::new(OcbcRateLimiter::new(
+        cfg.ocbc_corporate.max_calls_per_minute,
+    ));
+
     let mut bank_map: HashMap<String, Arc<dyn BankTechnicalAdapter>> = HashMap::new();
     let ocbc_corp = Arc::new(OcbcCorporateBankAdapter::new(
         cfg.ocbc_corporate.clone(),
         transport.clone(),
+        ocbc_token_vault.clone(),
+        ocbc_rate_limiter.clone(),
     ));
     bank_map.insert(ocbc_corp.adapter_id().to_string(), ocbc_corp);
 
@@ -139,6 +153,8 @@ async fn main() -> Result<()> {
     let ocbc_card = Arc::new(OcbcMerchantCardAdapter::new(
         cfg.ocbc_merchant_card.clone(),
         transport.clone(),
+        ocbc_token_vault.clone(),
+        ocbc_rate_limiter.clone(),
     ));
     acq_map.insert(ocbc_card.acquirer_id().to_string(), ocbc_card);
 
@@ -180,6 +196,10 @@ async fn main() -> Result<()> {
         relayer,
         bank_adapters,
         acquirer_adapters,
+        ocbc_token_vault,
+        ocbc_base_url: cfg.ocbc_corporate.base_url.clone(),
+        ocbc_client_id: cfg.ocbc_corporate.client_id.clone(),
+        ocbc_redirect_uri: cfg.ocbc_corporate.redirect_uri.clone(),
         admin_bearer_token: cfg.admin_bearer_token,
     });
 

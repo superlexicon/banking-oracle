@@ -241,16 +241,28 @@ fn setup_multi_entity_harness() -> TestHarness {
         })
         .unwrap();
 
+    let ocbc_token_vault = Arc::new(banking_oracle::adapters::ocbc_auth::OcbcTokenVault::new(
+        store.clone(),
+        Some("3f86faa0f22934789b71b79ac39ec34f".into()),
+    ));
+    let ocbc_rate_limiter = Arc::new(banking_oracle::adapters::ocbc_auth::OcbcRateLimiter::new(10));
+
     let ocbc_corp = Arc::new(OcbcCorporateBankAdapter::new(
         OcbcCorporateConfig {
             adapter_id: "ocbc_corporate".into(),
             base_url: "https://mock.ocbc.local".into(),
             client_id: "cid_corp".into(),
-            client_secret: "csec_corp".into(),
+            redirect_uri: "https://oracle.superlexicon.io/v1/oauth/ocbc/callback".into(),
+            default_access_token: Some("3f86faa0f22934789b71b79ac39ec34f".into()),
             webhook_secret: "whsec_ocbc_corp_test".into(),
             max_webhook_skew_secs: 300,
+            max_calls_per_minute: 10,
+            outbound_initiation_path: None,
+            outbound_inquiry_path: None,
         },
         transport.clone(),
+        ocbc_token_vault.clone(),
+        ocbc_rate_limiter.clone(),
     ));
 
     let dbs_iso = Arc::new(Iso20022BankAdapter::new(
@@ -269,12 +281,14 @@ fn setup_multi_entity_harness() -> TestHarness {
         OcbcMerchantCardConfig {
             acquirer_id: "ocbc_merchant_card".into(),
             base_url: "https://mock.ocbc.local".into(),
-            client_id: "cid_card".into(),
-            client_secret: "csec_card".into(),
-            webhook_secret: "whsec_ocbc_card_test".into(),
+            txn_signature_secret: "whsec_ocbc_card_test".into(),
+            enforce_response_signature: false,
             max_webhook_skew_secs: 300,
+            default_mdr_bps: 200,
         },
         transport.clone(),
+        ocbc_token_vault.clone(),
+        ocbc_rate_limiter.clone(),
     ));
 
     let stripe = Arc::new(StripeAcquirerAdapter::new(
@@ -321,6 +335,10 @@ fn setup_multi_entity_harness() -> TestHarness {
         relayer: relayer.clone(),
         bank_adapters,
         acquirer_adapters,
+        ocbc_token_vault,
+        ocbc_base_url: "https://mock.ocbc.local".into(),
+        ocbc_client_id: "cid_corp".into(),
+        ocbc_redirect_uri: "https://oracle.superlexicon.io/v1/oauth/ocbc/callback".into(),
         admin_bearer_token: "secret_admin_bearer".into(),
     });
 
@@ -345,39 +363,60 @@ async fn ocbc_merchant_card_to_ocbc_casa_t_plus_1_batch_settlement_and_l1_vouche
     let commit_1 = format!("0x{}", "aa".repeat(32));
     let commit_2 = format!("0x{}", "bb".repeat(32));
 
-    // Step 1: Two customers pay via OCBC Merchant Card Payments API (`SGD 400.00` + `SGD 670.00` = `SGD 1,070.00` gross)
-    for (txn_id, order_ref, amt_str, sku, commit) in [
-        ("OCBC-CARD-TX-101", "ORD-V1-01", "400.00", "slx-v1", &commit_1),
-        ("OCBC-CARD-TX-102", "ORD-G1-02", "670.00", "slx-g1", &commit_2),
+    // Step 1: Two customers pay via OCBC `POST /transactional/merchantcardpayments/1.0/sale` (`SGD 400.00` + `SGD 670.00` = `SGD 1,070.00` gross)
+    for (txn_id, order_ref, cents, sku, commit) in [
+        ("OCBC-CARD-TX-101", "ORD-V1-01", 40_000i128, "slx-v1", &commit_1),
+        ("OCBC-CARD-TX-102", "ORD-G1-02", 67_000i128, "slx-g1", &commit_2),
     ] {
-        let body = serde_json::to_vec(&json!({
-            "eventType": "CARD_CAPTURED",
-            "data": {
-                "merchantId": "OCBCMID8899001",
-                "cardTxnId": txn_id,
-                "orderRef": order_ref,
-                "amount": amt_str,
-                "currency": "SGD",
-                "settlementCurrency": "SGD",
-                "mdrFee": "0.00",
-                "metadata": {
-                    "sku": sku,
-                    "tier": "early_bird",
-                    "voucherCommitment": commit
+        h.transport.enqueue_json(
+            "mock.ocbc.local/transactional/merchantcardpayments/1.0/sale",
+            200,
+            json!({
+                "results": {
+                    "transactionId": txn_id,
+                    "merchantTranId": order_ref,
+                    "customerId": "CUST-SG-01",
+                    "authId": "AUTH8899",
+                    "responseCode": "0",
+                    "responseDesc": "Approved",
+                    "txnStatus": "SALES",
+                    "salesDate": "25-11-2026 14:22:10",
+                    "tranDate": "25-11-2026",
+                    "frScore": "05",
+                    "frLevel": "LOW"
+                },
+                "disclaimer": "OCBC Sandbox"
+            }),
+        );
+
+        let req_body = serde_json::to_vec(&json!({
+            "merchant_profile_id": "mch_slx_ocbc_card",
+            "payment": {
+                "order_reference": order_ref,
+                "customer_id": "CUST-SG-01",
+                "amount": { "amount_minor": cents, "currency": "SGD" },
+                "description": "SuperLexicon Hardware Order",
+                "capture_mode": "immediate_sale",
+                "voucher_metadata": {
+                    "sku_code": banking_oracle::domain::events::VoucherOrderMetadata::parse_sku_code(sku).unwrap(),
+                    "tier_bps": 15000,
+                    "voucher_commitment_hex": commit,
+                    "explicit_price_usd_micros": null
                 }
             }
         }))
         .unwrap();
-        let sig = sign_hmac_header("whsec_ocbc_card_test", now, &body);
+
         let resp = h
             .router
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/webhooks/acquirers/ocbc_merchant_card")
-                    .header("X-OCBC-Merchant-Signature", sig)
-                    .body(Body::from(body))
+                    .uri("/v1/payments/merchant/sessions")
+                    .header("Authorization", "Bearer secret_admin_bearer")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(req_body))
                     .unwrap(),
             )
             .await
@@ -406,98 +445,50 @@ async fn ocbc_merchant_card_to_ocbc_casa_t_plus_1_batch_settlement_and_l1_vouche
         "Zero on-chain finality tasks may fire before actual OCBC CASA deposit!"
     );
 
-    // Step 2: Parallel `PollingSupervisor` runs!
-    // - OCBC Merchant Card API returns EOD settlement batch (`gross = 1070.00`, `MDR = 21.40`, `net = 1048.60`, ref `OCBC-MC-STL-20261125-01`).
-    // - OCBC Corporate Banking `transactionHistory/1.0` returns BOTH:
-    //   a) The `SGD 1,048.60` merchant settlement credit on `acct_slx_ocbc_sgd`
-    //   b) A `USD 2,500.00` B2B customer invoice wire (`INV-9001`) on `acct_slx_ocbc_usd`!
-    // - DBS ISO 20022 statement poll returns empty for Entity B.
+    // Step 2: Parallel `PollingSupervisor` runs `GET /transactional/corpTransHistory/1.0?sessionToken=OAuth2INB%20...&accountId=...&fromDate=dd-mm-yyyy&toDate=dd-mm-yyyy`!
+    // First OCBC account poll (`acct_slx_ocbc_sgd`): settlement credit arrives BEFORE merchant settlement manifest (testing Bank-Credit-First out-of-order reconciliation!)
     h.transport.enqueue_json(
-        "mock.ocbc.local/ocbcauthentication/api/oauth2/token",
-        200,
-        json!({ "access_token": "tok_ocbc_corp_1", "expires_in": 3600 }),
-    );
-    h.transport.enqueue_json(
-        "mock.ocbc.local/ocbcauthentication/api/oauth2/token",
-        200,
-        json!({ "access_token": "tok_ocbc_card_1", "expires_in": 3600 }),
-    );
-    // First OCBC account poll: `acct_slx_ocbc_sgd` (settlement credit arrives BEFORE merchant batch poll — testing Bank-Credit-First out-of-order reconciliation!)
-    h.transport.enqueue_json(
-        "mock.ocbc.local/transactional/transactionHistory/1.0",
+        "mock.ocbc.local/transactional/corpTransHistory/1.0",
         200,
         json!({
-            "Results": {
-                "Transactions": [
-                    {
-                        "AccountNo": "501-889900-001",
-                        "TransactionRef": "OCBC-CASA-CR-77881",
-                        "DrCrIndicator": "C",
-                        "Status": "BOOKED",
-                        "CurrencyCode": "SGD",
-                        "CreditAmount": "1048.60",
-                        "BatchReference": "OCBC-MC-STL-20261125-01",
-                        "RemittanceInfo": "OCBC CARD SETTLEMENT OCBC-MC-STL-20261125-01",
-                        "ValueDate": "2026-11-25"
-                    }
-                ],
-                "NextCursor": "cur_sgd_1"
-            }
+            "success": true,
+            "results": [
+                {
+                    "amount": "1048.60",
+                    "debitCreditIndicator": "C",
+                    "transactionDate": "25-11-2026",
+                    "currencyCode": "SGD",
+                    "batchReference": "OCBC-MC-STL-20261125-01",
+                    "transactionDescription": "OCBC CARD SETTLEMENT OCBC-MC-STL-20261125-01"
+                }
+            ],
+            "errorMessage": null,
+            "disclaimer": "OCBC Sandbox"
         }),
     );
-    // Second OCBC account poll: `acct_slx_ocbc_usd` (`USD 2,500.00` invoice `INV-9001`)
+    // Second OCBC account poll (`acct_slx_ocbc_usd`): `USD 2,500.00` invoice `INV-9001`
     h.transport.enqueue_json(
-        "mock.ocbc.local/transactional/transactionHistory/1.0",
+        "mock.ocbc.local/transactional/corpTransHistory/1.0",
         200,
         json!({
-            "Results": {
-                "Transactions": [
-                    {
-                        "AccountNo": "501-889900-840",
-                        "TransactionRef": "OCBC-USD-TT-55002",
-                        "DrCrIndicator": "C",
-                        "Status": "BOOKED",
-                        "CurrencyCode": "USD",
-                        "CreditAmount": "2500.00",
-                        "RemittanceInfo": "B2B GATEWAY ORDER PAYMENT INV-9001",
-                        "ValueDate": "2026-11-25"
-                    }
-                ],
-                "NextCursor": "cur_usd_1"
-            }
+            "success": true,
+            "results": [
+                {
+                    "amount": "2500.00",
+                    "debitCreditIndicator": "C",
+                    "transactionDate": "25-11-2026",
+                    "currencyCode": "USD",
+                    "transactionDescription": "B2B GATEWAY ORDER PAYMENT INV-9001"
+                }
+            ],
+            "errorMessage": null,
+            "disclaimer": "OCBC Sandbox"
         }),
     );
     h.transport.enqueue_json(
         "mock.dbs.local/iso20022/v1/accounts/072-112233-0/statements",
         200,
         json!({ "BkToCstmrStmt": { "Stmt": { "Acct": { "Id": { "Othr": { "Id": "072-112233-0" } } }, "Ntry": [] } } }),
-    );
-    // OCBC Merchant Card batch poll returns `OCBC-MC-STL-20261125-01`
-    h.transport.enqueue_json(
-        "mock.ocbc.local/merchant/cardpayments/1.0/settlements",
-        200,
-        json!({
-            "Results": {
-                "batches": [
-                    {
-                        "merchantId": "OCBCMID8899001",
-                        "batchId": "BATCH-20261125-01",
-                        "bankSettlementRef": "OCBC-MC-STL-20261125-01",
-                        "settlementCurrency": "SGD",
-                        "grossSalesMinor": 107000,
-                        "refundsMinor": 0,
-                        "mdrFeeTotalMinor": 2140,
-                        "netSettlementMinor": 104860,
-                        "settlementDate": "2026-11-25",
-                        "transactions": [
-                            { "cardTxnId": "OCBC-CARD-TX-101", "type": "SALE", "settlementGrossMinor": 40000, "mdrFeeMinor": 800 },
-                            { "cardTxnId": "OCBC-CARD-TX-102", "type": "SALE", "settlementGrossMinor": 67000, "mdrFeeMinor": 1340 }
-                        ]
-                    }
-                ],
-                "nextCursor": "mc_cur_1"
-            }
-        }),
     );
     h.transport.enqueue_json(
         "mock.stripe.local/v1/payouts",
@@ -508,7 +499,57 @@ async fn ocbc_merchant_card_to_ocbc_casa_t_plus_1_batch_settlement_and_l1_vouche
     let report = h.poller.run_poll_cycle_once(now + 60).await;
     assert_eq!(report.errors, Vec::<String>::new());
     assert_eq!(report.incoming_credits_ingested, 2);
-    assert_eq!(report.settlement_batches_ingested, 1);
+
+    // Verify exact OCBC query parameters (`sessionToken=OAuth2INB%203f86...`, `fromDate`/`toDate` in `dd-mm-yyyy`)!
+    let recorded = h.transport.recorded_requests();
+    let hist_req = recorded
+        .iter()
+        .find(|r| r.url.contains("/transactional/corpTransHistory/1.0"))
+        .expect("corpTransHistory/1.0 called");
+    assert!(hist_req
+        .url
+        .contains("sessionToken=OAuth2INB%203f86faa0f22934789b71b79ac39ec34f"));
+    assert!(hist_req.url.contains("accountId=501-889900-001"));
+    assert!(hist_req.headers.iter().any(|(k, v)| {
+        k == "Authorization" && v == "Bearer 3f86faa0f22934789b71b79ac39ec34f"
+    }));
+
+    // Now post the EOD OCBC Merchant Settlement Batch manifest (`POST /v1/merchants/mch_slx_ocbc_card/settlement-batches`) ->
+    // reconciles against the already-polled `1048.60` `corpTransHistory/1.0` credit!
+    let batch_body = serde_json::to_vec(&json!({
+        "acquirer_adapter_id": "ocbc_merchant_card",
+        "external_merchant_id": "OCBCMID8899001",
+        "batch_id": "BATCH-20261125-01",
+        "bank_statement_reference": "OCBC-MC-STL-20261125-01",
+        "settlement_currency": "SGD",
+        "gross_sales_minor": 107000,
+        "refunds_minor": 0,
+        "total_fees_minor": 2140,
+        "net_payout_minor": 104860,
+        "settlement_date": "25-11-2026",
+        "created_at_unix": now + 62,
+        "lines": [
+            { "acquirer_payment_id": "OCBC-CARD-TX-101", "is_refund": false, "settlement_gross_minor": 40000, "settlement_fee_minor": 800, "settlement_net_minor": 39200 },
+            { "acquirer_payment_id": "OCBC-CARD-TX-102", "is_refund": false, "settlement_gross_minor": 67000, "settlement_fee_minor": 1340, "settlement_net_minor": 65660 }
+        ],
+        "source": "manual_sync"
+    }))
+    .unwrap();
+    let batch_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/merchants/mch_slx_ocbc_card/settlement-batches")
+                .header("Authorization", "Bearer secret_admin_bearer")
+                .header("Content-Type", "application/json")
+                .body(Body::from(batch_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(batch_resp.status(), StatusCode::OK);
 
     // Verify full double-entry Trial Balance across BOTH SGD and USD for Entity A!
     assert_entity_trial_balance_zero_net(&h.store, "ent_slx_sg");
@@ -845,24 +886,14 @@ async fn stripe_periodical_sweep_with_pre_sweep_refund_and_outbound_payment_poll
 
     // Poll #1: Outbound payment transitions `ACCP` -> `ACSP` (`InProcessing`) — still non-finalized!
     h.transport.enqueue_json(
-        "mock.ocbc.local/ocbcauthentication/api/oauth2/token",
+        "mock.ocbc.local/transactional/corpTransHistory/1.0",
         200,
-        json!({ "access_token": "tok_ocbc_corp_2", "expires_in": 3600 }),
+        json!({ "success": true, "results": [] }),
     );
     h.transport.enqueue_json(
-        "mock.ocbc.local/ocbcauthentication/api/oauth2/token",
+        "mock.ocbc.local/transactional/corpTransHistory/1.0",
         200,
-        json!({ "access_token": "tok_ocbc_card_2", "expires_in": 3600 }),
-    );
-    h.transport.enqueue_json(
-        "mock.ocbc.local/transactional/transactionHistory/1.0",
-        200,
-        json!({ "Results": { "Transactions": [] } }),
-    );
-    h.transport.enqueue_json(
-        "mock.ocbc.local/transactional/transactionHistory/1.0",
-        200,
-        json!({ "Results": { "Transactions": [] } }),
+        json!({ "success": true, "results": [] }),
     );
     h.transport.enqueue_json(
         "mock.dbs.local/iso20022/v1/accounts/072-112233-0/statements",
@@ -885,11 +916,6 @@ async fn stripe_periodical_sweep_with_pre_sweep_refund_and_outbound_payment_poll
         }),
     );
     h.transport.enqueue_json(
-        "mock.ocbc.local/merchant/cardpayments/1.0/settlements",
-        200,
-        json!({ "Results": { "batches": [] } }),
-    );
-    h.transport.enqueue_json(
         "mock.stripe.local/v1/payouts",
         200,
         json!({ "data": [] }),
@@ -904,14 +930,14 @@ async fn stripe_periodical_sweep_with_pre_sweep_refund_and_outbound_payment_poll
 
     // Poll #2: Outbound payment reaches `ACSC` (`Settled`) with `SGD 0.50` FAST fee -> burns `SGD 200.50` on-chain!
     h.transport.enqueue_json(
-        "mock.ocbc.local/transactional/transactionHistory/1.0",
+        "mock.ocbc.local/transactional/corpTransHistory/1.0",
         200,
-        json!({ "Results": { "Transactions": [] } }),
+        json!({ "success": true, "results": [] }),
     );
     h.transport.enqueue_json(
-        "mock.ocbc.local/transactional/transactionHistory/1.0",
+        "mock.ocbc.local/transactional/corpTransHistory/1.0",
         200,
-        json!({ "Results": { "Transactions": [] } }),
+        json!({ "success": true, "results": [] }),
     );
     h.transport.enqueue_json(
         "mock.dbs.local/iso20022/v1/accounts/072-112233-0/statements",
@@ -932,11 +958,6 @@ async fn stripe_periodical_sweep_with_pre_sweep_refund_and_outbound_payment_poll
                 }
             }
         }),
-    );
-    h.transport.enqueue_json(
-        "mock.ocbc.local/merchant/cardpayments/1.0/settlements",
-        200,
-        json!({ "Results": { "batches": [] } }),
     );
     h.transport.enqueue_json(
         "mock.stripe.local/v1/payouts",
@@ -1215,4 +1236,212 @@ async fn persistent_snapshot_reload_and_merchant_checkout_session_api() {
     let reloaded = OracleStore::open_persistent(&snap_path).unwrap();
     let exists = reloaded.read(|s| s.entities.contains_key("ent_persist"));
     assert!(exists, "Persistent OracleStore must survive process restart");
+}
+
+#[tokio::test]
+async fn official_ocbc_oauth_fragment_authorize_capture_void_query_and_10rpm_rate_limit() {
+    use banking_oracle::adapters::ocbc_auth::{
+        build_ocbc_oauth_authorize_url, parse_ocbc_oauth_fragment, OcbcRateLimiter,
+    };
+
+    let h = setup_multi_entity_harness();
+    let now = 1_795_700_000u64;
+
+    // 1. Verify OCBC OAuth 2.0 GET authorize URL & `#access_token=...` redirect fragment parsing
+    let auth_url = build_ocbc_oauth_authorize_url(
+        "https://api.ocbc.com",
+        "my_consumer_key",
+        "https://oracle.superlexicon.io/v1/oauth/ocbc/callback",
+        "transactional",
+    );
+    assert_eq!(
+        auth_url,
+        "https://api.ocbc.com/ocbcauthentication/api/oauth2/authorize?client_id=my_consumer_key&redirect_uri=https%3A%2F%2Foracle.superlexicon.io%2Fv1%2Foauth%2Focbc%2Fcallback&scope=transactional"
+    );
+
+    let rec = parse_ocbc_oauth_fragment(
+        "#access_token=489efb0ee095e75d625ccc0fa5f23e30&token_type=Bearer&expires_in=3600",
+        "default",
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        rec.authorization_bearer_header(),
+        "Bearer 489efb0ee095e75d625ccc0fa5f23e30"
+    );
+    assert_eq!(
+        rec.session_token_value(),
+        "OAuth2INB 489efb0ee095e75d625ccc0fa5f23e30"
+    );
+
+    // Save the OAuth fragment via `POST /v1/oauth/ocbc/token`
+    let save_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/oauth/ocbc/token")
+                .header("Authorization", "Bearer secret_admin_bearer")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "scope_key": "default",
+                        "fragment": "#access_token=489efb0ee095e75d625ccc0fa5f23e30&token_type=Bearer&expires_in=3600"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(save_resp.status(), StatusCode::OK);
+
+    // 2. Test OCBC Merchant Card `/authorize` -> `/query` -> `/capture` -> `/void`!
+    h.transport.enqueue_json(
+        "mock.ocbc.local/transactional/merchantcardpayments/1.0/authorize",
+        200,
+        json!({
+            "results": {
+                "transactionId": "OCBC-AUTH-5001",
+                "merchantTranId": "MTRAN-5001",
+                "customerId": "CUST-5001",
+                "authId": "812345",
+                "authDate": "25-11-2026 15:00:00",
+                "responseCode": "00",
+                "responseDesc": "Approved",
+                "txnStatus": "AUTHORIZED"
+            }
+        }),
+    );
+    let auth_card_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payments/merchant/sessions")
+                .header("Authorization", "Bearer secret_admin_bearer")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "merchant_profile_id": "mch_slx_ocbc_card",
+                        "payment": {
+                            "order_reference": "MTRAN-5001",
+                            "customer_id": "CUST-5001",
+                            "amount": { "amount_minor": 14900, "currency": "SGD" },
+                            "description": "SLX-L1 Hold",
+                            "capture_mode": "authorize_only"
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(auth_card_resp.status(), StatusCode::OK);
+    h.store.read(|s| {
+        assert_eq!(
+            s.clearing_items["ocbc_merchant_card:mch_slx_ocbc_card:OCBC-AUTH-5001"].status,
+            ClearingItemStatus::AuthorizedOnly
+        );
+    });
+
+    // Capture via `POST /v1/payments/merchant/capture` -> calls `POST /transactional/merchantcardpayments/1.0/capture`!
+    h.transport.enqueue_json(
+        "mock.ocbc.local/transactional/merchantcardpayments/1.0/capture",
+        200,
+        json!({
+            "results": {
+                "transactionId": "OCBC-AUTH-5001",
+                "merchantTranId": "MTRAN-5001",
+                "responseCode": "0",
+                "txnStatus": "CAPTURED",
+                "captureDate": "25-11-2026 15:05:00"
+            }
+        }),
+    );
+    let cap_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payments/merchant/capture")
+                .header("Authorization", "Bearer secret_admin_bearer")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "merchant_profile_id": "mch_slx_ocbc_card",
+                        "transaction_id": "OCBC-AUTH-5001",
+                        "merchant_tran_id": "MTRAN-5001",
+                        "amount": { "amount_minor": 14900, "currency": "SGD" }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cap_resp.status(), StatusCode::OK);
+    h.store.read(|s| {
+        assert_eq!(
+            s.clearing_items["ocbc_merchant_card:mch_slx_ocbc_card:OCBC-AUTH-5001"].status,
+            ClearingItemStatus::CapturedPendingBankSweep
+        );
+    });
+
+    // Void via `POST /v1/payments/merchant/void` -> calls `POST /transactional/merchantcardpayments/1.0/void`!
+    h.transport.enqueue_json(
+        "mock.ocbc.local/transactional/merchantcardpayments/1.0/void",
+        200,
+        json!({
+            "results": {
+                "transactionId": "OCBC-AUTH-5001",
+                "merchantTranId": "MTRAN-5001",
+                "responseCode": "0",
+                "txnStatus": "VOIDED",
+                "voidRevDate": "25-11-2026 15:10:00"
+            }
+        }),
+    );
+    let void_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payments/merchant/void")
+                .header("Authorization", "Bearer secret_admin_bearer")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "merchant_profile_id": "mch_slx_ocbc_card",
+                        "transaction_id": "OCBC-AUTH-5001",
+                        "merchant_tran_id": "MTRAN-5001",
+                        "amount": { "amount_minor": 14900, "currency": "SGD" }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(void_resp.status(), StatusCode::OK);
+    assert_entity_trial_balance_zero_net(&h.store, "ent_slx_sg");
+
+    // 3. Verify OCBC Usage Guideline `10 API calls / minute` sliding-window rate limiter!
+    let limiter = OcbcRateLimiter::new(10);
+    for i in 0..10 {
+        limiter.acquire_slot("tok_user_1", 1000 + i).await.unwrap();
+    }
+    assert!(
+        limiter.acquire_slot("tok_user_1", 1050).await.is_err(),
+        "11th OCBC API call within 60 seconds must be blocked by the 10 req/min rate limiter"
+    );
+    assert!(
+        limiter.acquire_slot("tok_user_1", 1061).await.is_ok(),
+        "Call at t+61s succeeds once oldest slot slides out of the 60s window"
+    );
 }

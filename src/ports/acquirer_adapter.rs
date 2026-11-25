@@ -2,10 +2,10 @@
 //!
 //! Models Merchant Payment Interfaces (such as **OCBC Merchant Card Payments API** and **Stripe**),
 //! keeping card/payment collection strictly segregated from corporate bank account cash finality
-//! and exposing periodical settlement batch / sweep manifests (`poll_settlement_batches`) so every
-//! processed payment is reconciled against the actual deposit hitting the bank account.
+//! and exposing full card transaction operations (`authorize` / `sale` / `capture` / `void` / `query`)
+//! plus periodical settlement batch / sweep manifests (`poll_settlement_batches`).
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -28,12 +28,35 @@ pub struct AcquirerBatchPollResult {
     pub next_cursor: AcquirerPollCursor,
 }
 
-/// Canonical request to open a card/checkout payment session via an acquirer (OCBC Card Gateway or Stripe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardCaptureMode {
+    /// Authorize hold only (e.g. OCBC `/authorize`); requires subsequent `capture_authorized_payment`.
+    AuthorizeOnly,
+    /// Immediate authorize + capture sale (e.g. OCBC `/sale`).
+    ImmediateSale,
+}
+
+impl Default for CardCaptureMode {
+    fn default() -> Self {
+        Self::ImmediateSale
+    }
+}
+
+/// Canonical request to execute or open a card/checkout payment via an acquirer (OCBC Card API or Stripe).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerchantPaymentRequest {
+    /// Maps to `merchantTranId` in OCBC `merchantcardpayments/1.0` or `client_reference_id` in Stripe.
     pub order_reference: String,
+    /// Maps to `customerId` in OCBC `merchantcardpayments/1.0`.
+    pub customer_id: Option<String>,
     pub amount: Money,
     pub description: String,
+    #[serde(default)]
+    pub capture_mode: CardCaptureMode,
+    /// Optional tokenized/encrypted card payload fields forwarded verbatim to direct card APIs (`/authorize` or `/sale`).
+    #[serde(default)]
+    pub acquirer_specific_payload: serde_json::Value,
     pub success_url: Option<String>,
     pub cancel_url: Option<String>,
     pub structured_invoice_id: Option<u64>,
@@ -43,8 +66,15 @@ pub struct MerchantPaymentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerchantPaymentSession {
     pub acquirer_id: String,
+    /// Maps to `transactionId` in OCBC `merchantcardpayments/1.0` or `payment_intent` in Stripe.
     pub acquirer_payment_id: String,
+    pub auth_id: Option<String>,
+    pub response_code: Option<String>,
+    pub txn_status: Option<String>,
     pub checkout_url_or_token: String,
+    /// If the synchronous API call (`/authorize` or `/sale`) already produced a canonical payment event,
+    /// returns it here so the caller immediately records it in the clearing sub-ledger!
+    pub immediate_event: Option<CanonicalAcquirerEvent>,
     pub created_at_unix: u64,
 }
 
@@ -56,13 +86,43 @@ pub trait PaymentAcquirerAdapter: Send + Sync {
     /// Human-readable acquirer / payment gateway name.
     fn acquirer_name(&self) -> &str;
 
-    /// Create an outbound merchant card payment session / payment intent with order & voucher metadata locked.
+    /// Execute an outbound merchant card `/authorize` or `/sale` (or create a Stripe Checkout Session).
     async fn create_payment_session(
         &self,
         merchant: &MerchantProfile,
         req: &MerchantPaymentRequest,
         now_unix_secs: u64,
     ) -> Result<MerchantPaymentSession>;
+
+    /// Capture a previously authorized transaction (e.g., `POST /transactional/merchantcardpayments/1.0/capture`).
+    async fn capture_authorized_payment(
+        &self,
+        _merchant: &MerchantProfile,
+        _acquirer_payment_id: &str,
+        _merchant_order_ref: &str,
+        _amount: &Money,
+        _now_unix_secs: u64,
+    ) -> Result<CanonicalAcquirerEvent> {
+        Err(anyhow!(
+            "capture_authorized_payment is not supported by acquirer '{}'",
+            self.acquirer_id()
+        ))
+    }
+
+    /// Void/cancel a transaction before settlement (e.g., `POST /transactional/merchantcardpayments/1.0/void`).
+    async fn void_payment(
+        &self,
+        _merchant: &MerchantProfile,
+        _acquirer_payment_id: &str,
+        _merchant_order_ref: &str,
+        _amount: &Money,
+        _now_unix_secs: u64,
+    ) -> Result<CanonicalAcquirerEvent> {
+        Err(anyhow!(
+            "void_payment is not supported by acquirer '{}'",
+            self.acquirer_id()
+        ))
+    }
 
     /// Verify inbound payment/refund/payout webhook signature and translate into `CanonicalAcquirerEvent`s.
     async fn verify_and_parse_webhook(
@@ -72,7 +132,7 @@ pub trait PaymentAcquirerAdapter: Send + Sync {
         now_unix_secs: u64,
     ) -> Result<Vec<CanonicalAcquirerEvent>>;
 
-    /// Poll the acquirer's transaction inquiry API for a specific payment's authorization/capture/refund status.
+    /// Poll the acquirer's transaction inquiry API (e.g., `POST /transactional/merchantcardpayments/1.0/query`).
     async fn poll_payment_status(
         &self,
         merchant: &MerchantProfile,

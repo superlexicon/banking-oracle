@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::adapters::ocbc_auth::OcbcSessionTokenRecord;
 use crate::domain::entities::{AccountOwner, BankAccount, Counterparty, MerchantProfile};
 use crate::domain::ledger::{
     AcquirerClearingItem, BankCreditRecord, EntrySide, LedgerJournalEntry, OnChainOutboxTask,
@@ -34,6 +35,8 @@ pub struct StoreSnapshot {
     pub journals: Vec<LedgerJournalEntry>,
     pub outbox: IndexMap<String, OnChainOutboxTask>,
     pub outbox_dedup: HashSet<String>,
+    #[serde(default)]
+    pub ocbc_tokens: BTreeMap<String, OcbcSessionTokenRecord>,
 }
 
 /// Per-account trial balance row (`debit_minor`, `credit_minor`, `net_dr_minus_cr_minor`).
@@ -169,6 +172,13 @@ impl OracleStore {
     pub fn upsert_counterparty(&self, cp: Counterparty) -> Result<()> {
         self.write(|s| {
             s.counterparties.insert(cp.counterparty_id.clone(), cp);
+            Ok(())
+        })
+    }
+
+    pub fn upsert_ocbc_token(&self, token: OcbcSessionTokenRecord) -> Result<()> {
+        self.write(|s| {
+            s.ocbc_tokens.insert(token.scope_key.clone(), token);
             Ok(())
         })
     }

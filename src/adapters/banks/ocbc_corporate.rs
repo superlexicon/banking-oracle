@@ -1,21 +1,36 @@
-//! CONNECT2OCBC Corporate & Transactional Banking Technical Adapter (`OcbcCorporateBankAdapter`).
+//! Official CONNECT2OCBC Corporate Transaction History & Banking Adapter (`OcbcCorporateBankAdapter`).
 //!
-//! Encapsulates OCBC's OAuth 2.0 token flow (`Authorization: Bearer <token>`), webhook authentication
-//! (`X-OCBC-Signature` HMAC-SHA256 & `X-JWS-Signature` detached HS256 JWS), corporate transaction
-//! history polling (`/transactional/transactionHistory/1.0`), and FAST / PayNow / GIRO / MEPS+ / TT
-//! outbound payment initiation & status inquiries (`/transactional/paymentInquiry/1.0`).
+//! Implements the exact documented OCBC Corporate Transaction History specification:
+//! - **Endpoint**: `GET https://api.ocbc.com/transactional/corpTransHistory/1.0`
+//! - **Headers**:
+//!   - `Authorization: Bearer <access_token>`
+//!   - `Accept: application/json`
+//! - **Query Parameters**:
+//!   - `sessionToken` (`string`): `OAuth2INB <access_token>` (retrieved via OCBC OAuth 2.0 `authorize` redirect)
+//!   - `accountId` (`string`): Corporate Account ID
+//!   - `fromDate` (`string`): Start date in **`dd-mm-yyyy`** format
+//!   - `toDate` (`string`): End date in **`dd-mm-yyyy`** format
+//! - **Response JSON (`Resource Representations`)**:
+//!   - `success` (`boolean`)
+//!   - `results` (`array` of `{ amount, debitCreditIndicator, transactionDate, currencyCode, ... }`)
+//!   - `errorMessage` (`string`)
+//!   - `disclaimer` (`string`)
+//! - **Rate Limit**: Enforces OCBC's documented default limit of `10 API calls / minute` per user token.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
+use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
 
-use crate::crypto::{verify_jws_hs256, verify_timestamped_hmac_header};
+use crate::adapters::ocbc_auth::{
+    url_encode_component, OcbcRateLimiter, OcbcTokenVault,
+};
+use crate::crypto::{keccak256, verify_jws_hs256, verify_timestamped_hmac_header};
 use crate::domain::entities::BankAccount;
 use crate::domain::events::{
     AppliedCreditEvent, CanonicalBankEvent, IngestionSource, OutboundPaymentState,
@@ -33,10 +48,29 @@ use crate::ports::http_transport::{HttpMethod, HttpTransport, OutboundHttpReques
 pub struct OcbcCorporateConfig {
     pub adapter_id: String,
     pub base_url: String,
+    /// Application Consumer Key (`client_id`) from OCBC API Store -> Subscriptions.
     pub client_id: String,
-    pub client_secret: String,
+    /// Registered OAuth 2.0 Redirect URL approved by OCBC's API Team.
+    pub redirect_uri: String,
+    /// Optional Sandbox / API Console static `access_token` (used when interactive OAuth2 sessionToken has not yet been posted).
+    #[serde(default)]
+    pub default_access_token: Option<String>,
     pub webhook_secret: String,
     pub max_webhook_skew_secs: u64,
+    /// OCBC Usage Guideline default = `10` API calls per minute per user.
+    #[serde(default = "default_ocbc_rpm")]
+    pub max_calls_per_minute: usize,
+    /// Optional host-to-host outbound initiation endpoint path if enabled on your OCBC corporate tier.
+    #[serde(default)]
+    pub outbound_initiation_path: Option<String>,
+    /// Optional dedicated outbound status inquiry endpoint path; when `None`, `poll_outbound_payment_status`
+    /// reconciles finalized debits (`debitCreditIndicator == "D"`) directly from `corpTransHistory/1.0`!
+    #[serde(default)]
+    pub outbound_inquiry_path: Option<String>,
+}
+
+fn default_ocbc_rpm() -> usize {
+    10
 }
 
 impl Default for OcbcCorporateConfig {
@@ -44,98 +78,93 @@ impl Default for OcbcCorporateConfig {
         Self {
             adapter_id: "ocbc_corporate".into(),
             base_url: "https://api.ocbc.com".into(),
-            client_id: "ocbc_sandbox_client_id".into(),
-            client_secret: "ocbc_sandbox_client_secret".into(),
+            client_id: "ocbc_consumer_key".into(),
+            redirect_uri: "https://oracle.superlexicon.io/v1/oauth/ocbc/callback".into(),
+            default_access_token: None,
             webhook_secret: "whsec_ocbc_corporate_dev".into(),
             max_webhook_skew_secs: 300,
+            max_calls_per_minute: 10,
+            outbound_initiation_path: None,
+            outbound_inquiry_path: None,
         }
     }
 }
 
-#[derive(Default)]
-struct CachedOAuthToken {
-    access_token: String,
-    expires_at_unix: u64,
+/// Exact response schema documented by OCBC for `GET /transactional/corpTransHistory/1.0`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(non_snake_case)]
+pub struct OcbcCorpTransHistoryResponse {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub results: Vec<OcbcCorpTransHistoryEntry>,
+    pub errorMessage: Option<String>,
+    pub disclaimer: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(non_snake_case)]
+pub struct OcbcCorpTransHistoryEntry {
+    pub amount: String,
+    pub debitCreditIndicator: String,
+    pub transactionDate: String,
+    pub currencyCode: String,
+    /// Optional extended fields if provided by OCBC corporate host feed or API console profile:
+    #[serde(default, alias = "transactionRef", alias = "referenceNo")]
+    pub transactionId: Option<String>,
+    #[serde(default, alias = "description", alias = "narrative", alias = "remittanceInfo")]
+    pub transactionDescription: Option<String>,
+    #[serde(default, alias = "settlementRef")]
+    pub batchReference: Option<String>,
+    #[serde(default)]
+    pub clientRef: Option<String>,
 }
 
 pub struct OcbcCorporateBankAdapter {
     cfg: OcbcCorporateConfig,
     transport: Arc<dyn HttpTransport>,
-    token_cache: Mutex<CachedOAuthToken>,
+    token_vault: Arc<OcbcTokenVault>,
+    rate_limiter: Arc<OcbcRateLimiter>,
 }
 
 impl OcbcCorporateBankAdapter {
-    pub fn new(cfg: OcbcCorporateConfig, transport: Arc<dyn HttpTransport>) -> Self {
+    pub fn new(
+        cfg: OcbcCorporateConfig,
+        transport: Arc<dyn HttpTransport>,
+        token_vault: Arc<OcbcTokenVault>,
+        rate_limiter: Arc<OcbcRateLimiter>,
+    ) -> Self {
         Self {
             cfg,
             transport,
-            token_cache: Mutex::new(CachedOAuthToken::default()),
+            token_vault,
+            rate_limiter,
         }
     }
 
-    async fn bearer_token(&self, now_unix: u64) -> Result<String> {
-        let mut guard = self.token_cache.lock().await;
-        if !guard.access_token.is_empty() && guard.expires_at_unix > now_unix + 30 {
-            return Ok(guard.access_token.clone());
-        }
-
-        let url = format!(
-            "{}/ocbcauthentication/api/oauth2/token",
-            self.cfg.base_url.trim_end_matches('/')
-        );
-        let body = format!(
-            "grant_type=client_credentials&client_id={}&client_secret={}&scope=transactional",
-            self.cfg.client_id, self.cfg.client_secret
-        );
-        let resp = self
-            .transport
-            .execute(OutboundHttpRequest {
-                method: HttpMethod::Post,
-                url,
-                headers: vec![
-                    (
-                        "Content-Type".into(),
-                        "application/x-www-form-urlencoded".into(),
-                    ),
-                    ("Accept".into(), "application/json".into()),
-                ],
-                body: body.into_bytes(),
-            })
-            .await?;
-
-        if !resp.is_success() {
-            return Err(anyhow!(
-                "OCBC OAuth2 token request failed with HTTP {}",
-                resp.status
-            ));
-        }
-        let val: serde_json::Value = resp.json()?;
-        let tok = val
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing access_token in OCBC OAuth2 response"))?
-            .to_string();
-        let ttl = val
-            .get("expires_in")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3600);
-        guard.access_token = tok.clone();
-        guard.expires_at_unix = now_unix + ttl;
-        Ok(tok)
+    pub fn config(&self) -> &OcbcCorporateConfig {
+        &self.cfg
     }
 
-    fn parse_rail(raw: Option<&str>) -> TransferRail {
-        match raw.unwrap_or("").trim().to_ascii_uppercase().as_str() {
-            "FAST" => TransferRail::Fast,
-            "PAYNOW" | "SGQR" => TransferRail::PayNow,
-            "GIRO" | "IBG" => TransferRail::Giro,
-            "MEPS" | "MEPS+" => TransferRail::MepsPlus,
-            "TT" | "SWIFT" | "GPI" => TransferRail::SwiftGpi,
-            "IFT" | "INTERNAL" => TransferRail::InternalBook,
-            "SETTLEMENT" | "MERCHANT_SETTLEMENT" => TransferRail::AcquirerSettlementSweep,
-            "" => TransferRail::Fast,
-            other => TransferRail::Other(other.to_string()),
-        }
+    pub fn format_dd_mm_yyyy(unix_secs: u64) -> String {
+        Utc.timestamp_opt(unix_secs as i64, 0)
+            .single()
+            .map(|dt| dt.format("%d-%m-%Y").to_string())
+            .unwrap_or_else(|| "01-01-2026".to_string())
+    }
+
+    pub fn is_credit_indicator(ind: &str) -> bool {
+        matches!(
+            ind.trim().to_ascii_uppercase().as_str(),
+            "C" | "CR" | "CRDT" | "CREDIT"
+        )
+    }
+
+    pub fn is_debit_indicator(ind: &str) -> bool {
+        matches!(
+            ind.trim().to_ascii_uppercase().as_str(),
+            "D" | "DR" | "DBIT" | "DEBIT"
+        )
     }
 
     pub fn map_ocbc_outbound_state(status: &str) -> Result<OutboundPaymentState> {
@@ -155,10 +184,7 @@ impl OcbcCorporateBankAdapter {
         }
     }
 
-    fn extract_invoice_id(remittance: &str, explicit: Option<u64>) -> Option<u64> {
-        if explicit.is_some() {
-            return explicit;
-        }
+    fn extract_invoice_id(remittance: &str) -> Option<u64> {
         let upper = remittance.to_ascii_uppercase();
         if let Some(idx) = upper.find("INV-") {
             let digits: String = upper[idx + 4..]
@@ -172,157 +198,99 @@ impl OcbcCorporateBankAdapter {
         None
     }
 
-    fn parse_voucher_meta(obj: &serde_json::Value) -> Result<Option<VoucherOrderMetadata>> {
-        let Some(vm) = obj.get("voucherMetadata").or_else(|| obj.get("voucher_metadata")) else {
-            return Ok(None);
-        };
-        if vm.is_null() {
-            return Ok(None);
+    /// Execute the exact documented `GET /transactional/corpTransHistory/1.0` call with
+    /// `sessionToken=OAuth2INB <token>`, `accountId`, `fromDate` (`dd-mm-yyyy`), `toDate` (`dd-mm-yyyy`),
+    /// and `Authorization: Bearer <access_token>`.
+    async fn fetch_corp_trans_history(
+        &self,
+        account: &BankAccount,
+        from_unix: u64,
+        to_unix: u64,
+        now_unix: u64,
+    ) -> Result<OcbcCorpTransHistoryResponse> {
+        let tok = self
+            .token_vault
+            .resolve_token(Some(&account.account_id), now_unix)?;
+        self.rate_limiter
+            .acquire_slot(&tok.access_token, now_unix)
+            .await?;
+
+        let from_date = Self::format_dd_mm_yyyy(from_unix);
+        let to_date = Self::format_dd_mm_yyyy(to_unix);
+
+        let url = format!(
+            "{}/transactional/corpTransHistory/1.0?sessionToken={}&accountId={}&fromDate={}&toDate={}",
+            self.cfg.base_url.trim_end_matches('/'),
+            tok.session_token_url_encoded(),
+            url_encode_component(&account.external_account_number),
+            url_encode_component(&from_date),
+            url_encode_component(&to_date),
+        );
+
+        let resp = self
+            .transport
+            .execute(OutboundHttpRequest {
+                method: HttpMethod::Get,
+                url,
+                headers: vec![
+                    ("Authorization".into(), tok.authorization_bearer_header()),
+                    ("Accept".into(), "application/json".into()),
+                ],
+                body: vec![],
+            })
+            .await?;
+
+        if !resp.is_success() {
+            return Err(anyhow!(
+                "OCBC corpTransHistory/1.0 failed with HTTP {}: {}",
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            ));
         }
-        let sku_code = if let Some(n) = vm.get("skuCode").or_else(|| vm.get("sku_code")).and_then(|x| x.as_u64()) {
-            n
-        } else if let Some(s) = vm.get("sku").and_then(|x| x.as_str()) {
-            VoucherOrderMetadata::parse_sku_code(s)?
-        } else {
-            return Err(anyhow!("missing sku in voucherMetadata"));
-        };
-        let tier_bps = if let Some(n) = vm.get("tierBps").or_else(|| vm.get("tier_bps")).and_then(|x| x.as_u64()) {
-            n
-        } else if let Some(s) = vm.get("tier").and_then(|x| x.as_str()) {
-            VoucherOrderMetadata::parse_tier_bps(s)?
-        } else {
-            10_000
-        };
-        let commit = vm
-            .get("voucherCommitment")
-            .or_else(|| vm.get("voucher_commitment"))
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("missing voucherCommitment"))?
-            .to_string();
-        let explicit_usd = vm
-            .get("priceUsdMicros")
-            .or_else(|| vm.get("price_usd_micros"))
-            .and_then(|x| x.as_u64());
-        Ok(Some(VoucherOrderMetadata {
-            sku_code,
-            tier_bps,
-            voucher_commitment_hex: commit,
-            explicit_price_usd_micros: explicit_usd,
-        }))
+
+        let parsed: OcbcCorpTransHistoryResponse = resp.json()?;
+        if !parsed.success {
+            return Err(anyhow!(
+                "OCBC corpTransHistory/1.0 returned success=false: {}",
+                parsed
+                    .errorMessage
+                    .unwrap_or_else(|| "unspecified OCBC error".into())
+            ));
+        }
+        Ok(parsed)
     }
 
-    fn parse_credit_json(
-        &self,
-        item: &serde_json::Value,
-        default_acct_no: Option<&str>,
-        default_ccy: Option<&CurrencyCode>,
-        source: IngestionSource,
-        fallback_now: u64,
-    ) -> Result<AppliedCreditEvent> {
-        let acct_no = item
-            .get("AccountNo")
-            .or_else(|| item.get("accountNo"))
-            .and_then(|v| v.as_str())
-            .or(default_acct_no)
-            .ok_or_else(|| anyhow!("missing AccountNo in OCBC credit entry"))?
-            .to_string();
-
-        let ccy = if let Some(c_str) = item
-            .get("CurrencyCode")
-            .or_else(|| item.get("currency"))
-            .and_then(|v| v.as_str())
-        {
-            CurrencyCode::new(c_str)?
-        } else if let Some(dc) = default_ccy {
-            dc.clone()
-        } else {
-            CurrencyCode::sgd()
-        };
-
-        let amount = if let Some(minor) = item.get("amountMinor").and_then(|v| v.as_i64()) {
-            Money::new(minor as i128, ccy)
-        } else if let Some(dec_str) = item
-            .get("CreditAmount")
-            .or_else(|| item.get("Amount"))
-            .and_then(|v| v.as_str())
-        {
-            Money::new(ccy.parse_decimal_to_minor(dec_str)?, ccy)
-        } else if let Some(num) = item
-            .get("CreditAmount")
-            .or_else(|| item.get("Amount"))
-            .and_then(|v| v.as_f64())
-        {
-            let formatted = format!("{:.*}", ccy.minor_decimals() as usize, num);
-            Money::new(ccy.parse_decimal_to_minor(&formatted)?, ccy)
-        } else {
-            return Err(anyhow!("missing CreditAmount / Amount in OCBC credit entry"));
-        };
-
-        let tx_id = item
-            .get("TransactionRef")
-            .or_else(|| item.get("BankRef"))
-            .or_else(|| item.get("transactionId"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing TransactionRef in OCBC credit entry"))?
-            .to_string();
-
-        let remittance = item
-            .get("RemittanceInfo")
-            .or_else(|| item.get("Narrative"))
-            .or_else(|| item.get("PaymentDetails"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let explicit_inv = item.get("invoiceId").and_then(|v| v.as_u64());
-        let voucher_metadata = Self::parse_voucher_meta(item)?;
-
-        Ok(AppliedCreditEvent {
-            bank_adapter_id: self.cfg.adapter_id.clone(),
-            external_account_number: acct_no,
-            bank_tx_id: tx_id,
-            end_to_end_id: item
-                .get("EndToEndId")
-                .or_else(|| item.get("endToEndId"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            batch_or_sweep_ref: item
-                .get("BatchReference")
-                .or_else(|| item.get("SettlementRef"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            rail: Self::parse_rail(
-                item.get("PaymentType")
-                    .or_else(|| item.get("Channel"))
-                    .and_then(|v| v.as_str()),
-            ),
-            amount,
-            value_date: item
-                .get("ValueDate")
-                .and_then(|v| v.as_str())
-                .unwrap_or("2026-11-25")
-                .to_string(),
-            booked_at_unix: item
-                .get("BookedAtUnix")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(fallback_now),
-            structured_invoice_id: Self::extract_invoice_id(&remittance, explicit_inv),
-            remittance_info: remittance,
-            payer_name: item
-                .get("SenderName")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            payer_account: item
-                .get("SenderAccountNo")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            voucher_metadata,
-            running_balance_minor: item
-                .get("RunningBalanceMinor")
-                .and_then(|v| v.as_i64())
-                .map(|n| n as i128),
-            source,
-        })
+    /// Synthesize a deterministic, poll-idempotent `bank_tx_id` when OCBC's `corpTransHistory/1.0`
+    /// row only provides `{ amount, debitCreditIndicator, transactionDate, currencyCode }` without
+    /// a dedicated reference number:
+    /// - Two identical `SGD 299.00` credits on `25-11-2026` receive `#occ0` and `#occ1` (neither is dropped!).
+    /// - Re-polling `25-11-2026` produces the exact same `#occ0` and `#occ1` IDs (zero duplicates!).
+    fn deterministic_entry_tx_id(
+        account_no: &str,
+        entry: &OcbcCorpTransHistoryEntry,
+        amount_minor: i128,
+        occurrence_within_poll: usize,
+    ) -> String {
+        if let Some(explicit_id) = &entry.transactionId {
+            if !explicit_id.trim().is_empty() {
+                return explicit_id.trim().to_string();
+            }
+        }
+        let desc = entry.transactionDescription.as_deref().unwrap_or("");
+        let fp = keccak256(
+            format!(
+                "OCBC_CORP_HIST_V1|{}|{}|{}|{}|{}|{}|{}",
+                account_no,
+                entry.transactionDate.trim(),
+                entry.debitCreditIndicator.trim().to_ascii_uppercase(),
+                entry.currencyCode.trim().to_ascii_uppercase(),
+                amount_minor,
+                desc.trim(),
+                occurrence_within_poll
+            )
+            .as_bytes(),
+        );
+        format!("OCBC-HIST-{}", hex::encode(&fp[0..12]))
     }
 }
 
@@ -363,13 +331,12 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
             .get("alertType")
             .or_else(|| payload.get("eventType"))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("CREDIT_NOTIFICATION");
 
         match alert_type.to_ascii_uppercase().as_str() {
             "CREDIT_NOTIFICATION" | "INCOMING_FUNDS" => {
                 let data = payload.get("data").unwrap_or(&payload);
-                // Ignore unfinalized float notifications if status is explicitly pending
-                if let Some(st) = data.get("Status").and_then(|v| v.as_str()) {
+                if let Some(st) = data.get("Status").or_else(|| data.get("status")).and_then(|v| v.as_str()) {
                     if !matches!(
                         st.to_ascii_uppercase().as_str(),
                         "BOOKED" | "POSTED" | "APPLIED" | "FINALIZED"
@@ -377,81 +344,168 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
                         return Ok(vec![]);
                     }
                 }
-                let ev = self.parse_credit_json(
-                    data,
-                    None,
-                    None,
-                    IngestionSource::WebhookPush,
-                    now_unix_secs,
+                let acct_no = data
+                    .get("accountId")
+                    .or_else(|| data.get("AccountNo"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing accountId / AccountNo in OCBC credit alert"))?
+                    .to_string();
+                let ccy = CurrencyCode::new(
+                    data.get("currencyCode")
+                        .or_else(|| data.get("CurrencyCode"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("SGD"),
                 )?;
-                Ok(vec![CanonicalBankEvent::AppliedCredit(ev)])
+                let amt_str = data
+                    .get("amount")
+                    .or_else(|| data.get("CreditAmount"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing amount / CreditAmount in OCBC credit alert"))?;
+                let amount = Money::new(ccy.parse_decimal_to_minor(amt_str)?, ccy);
+                let tx_id = data
+                    .get("transactionId")
+                    .or_else(|| data.get("TransactionRef"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing transactionId / TransactionRef in OCBC credit alert"))?
+                    .to_string();
+                let remittance = data
+                    .get("remittanceInfo")
+                    .or_else(|| data.get("RemittanceInfo"))
+                    .or_else(|| data.get("transactionDescription"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let voucher_meta = if let Some(vm) = data.get("voucherMetadata") {
+                    let sku = vm["sku"]
+                        .as_str()
+                        .map(VoucherOrderMetadata::parse_sku_code)
+                        .transpose()?
+                        .or_else(|| vm["skuCode"].as_u64())
+                        .unwrap_or(1);
+                    let tier = vm["tier"]
+                        .as_str()
+                        .map(VoucherOrderMetadata::parse_tier_bps)
+                        .transpose()?
+                        .or_else(|| vm["tierBps"].as_u64())
+                        .unwrap_or(10_000);
+                    vm["voucherCommitment"].as_str().map(|c| VoucherOrderMetadata {
+                        sku_code: sku,
+                        tier_bps: tier,
+                        voucher_commitment_hex: c.to_string(),
+                        explicit_price_usd_micros: vm["priceUsdMicros"].as_u64(),
+                    })
+                } else {
+                    None
+                };
+
+                Ok(vec![CanonicalBankEvent::AppliedCredit(AppliedCreditEvent {
+                    bank_adapter_id: self.cfg.adapter_id.clone(),
+                    external_account_number: acct_no,
+                    bank_tx_id: tx_id,
+                    end_to_end_id: data
+                        .get("endToEndId")
+                        .or_else(|| data.get("EndToEndId"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    batch_or_sweep_ref: data
+                        .get("batchReference")
+                        .or_else(|| data.get("BatchReference"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    rail: TransferRail::Fast,
+                    amount,
+                    value_date: data
+                        .get("transactionDate")
+                        .or_else(|| data.get("ValueDate"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("25-11-2026")
+                        .to_string(),
+                    booked_at_unix: now_unix_secs,
+                    structured_invoice_id: Self::extract_invoice_id(&remittance),
+                    remittance_info: remittance,
+                    payer_name: data
+                        .get("senderName")
+                        .or_else(|| data.get("SenderName"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    payer_account: data
+                        .get("senderAccountNo")
+                        .or_else(|| data.get("SenderAccountNo"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    voucher_metadata: voucher_meta,
+                    running_balance_minor: None,
+                    source: IngestionSource::WebhookPush,
+                })])
             }
             "PAYMENT_STATUS" | "OUTBOUND_STATUS" => {
                 let data = payload.get("data").unwrap_or(&payload);
                 let ccy = CurrencyCode::new(
-                    data.get("CurrencyCode")
+                    data.get("currencyCode")
+                        .or_else(|| data.get("CurrencyCode"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("SGD"),
                 )?;
-                let amt_minor = if let Some(m) = data.get("amountMinor").and_then(|v| v.as_i64()) {
-                    m as i128
-                } else {
-                    let s = data
-                        .get("Amount")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0.00");
-                    ccy.parse_decimal_to_minor(s)?
-                };
-                let fee_minor = if let Some(m) = data.get("feeMinor").and_then(|v| v.as_i64()) {
-                    m as i128
-                } else if let Some(s) = data.get("BankFee").and_then(|v| v.as_str()) {
-                    ccy.parse_decimal_to_minor(s)?
-                } else {
-                    0
-                };
-                let state_str = data
-                    .get("PaymentStatus")
+                let amt_str = data
+                    .get("amount")
+                    .or_else(|| data.get("Amount"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0.00");
+                let fee_str = data
+                    .get("bankFee")
+                    .or_else(|| data.get("BankFee"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0.00");
+                let st_str = data
+                    .get("paymentStatus")
+                    .or_else(|| data.get("PaymentStatus"))
                     .or_else(|| data.get("Status"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing PaymentStatus in OCBC outbound webhook"))?;
-                let out = OutboundPaymentStatusEvent {
-                    bank_adapter_id: self.cfg.adapter_id.clone(),
-                    external_account_number: data
-                        .get("AccountNo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    client_instruction_id: data
-                        .get("ClientRef")
-                        .or_else(|| data.get("CustomerReference"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow!("missing ClientRef in OCBC outbound webhook"))?
-                        .to_string(),
-                    bank_payment_id: data
-                        .get("BankPaymentId")
-                        .or_else(|| data.get("TransactionRef"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    end_to_end_id: data
-                        .get("EndToEndId")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    rail: Self::parse_rail(data.get("PaymentType").and_then(|v| v.as_str())),
-                    state: Self::map_ocbc_outbound_state(state_str)?,
-                    amount: Money::new(amt_minor, ccy),
-                    bank_fee_minor: fee_minor,
-                    reason_code: data
-                        .get("ReasonCode")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    reason_detail: data
-                        .get("ReasonDescription")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    updated_at_unix: now_unix_secs,
-                    source: IngestionSource::WebhookPush,
-                };
-                Ok(vec![CanonicalBankEvent::OutboundStatusChanged(out)])
+
+                Ok(vec![CanonicalBankEvent::OutboundStatusChanged(
+                    OutboundPaymentStatusEvent {
+                        bank_adapter_id: self.cfg.adapter_id.clone(),
+                        external_account_number: data
+                            .get("accountId")
+                            .or_else(|| data.get("AccountNo"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        client_instruction_id: data
+                            .get("clientRef")
+                            .or_else(|| data.get("ClientRef"))
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow!("missing clientRef / ClientRef"))?
+                            .to_string(),
+                        bank_payment_id: data
+                            .get("transactionId")
+                            .or_else(|| data.get("BankPaymentId"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        end_to_end_id: data
+                            .get("endToEndId")
+                            .or_else(|| data.get("EndToEndId"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        rail: TransferRail::Fast,
+                        state: Self::map_ocbc_outbound_state(st_str)?,
+                        amount: Money::new(ccy.parse_decimal_to_minor(amt_str)?, ccy.clone()),
+                        bank_fee_minor: ccy.parse_decimal_to_minor(fee_str)?,
+                        reason_code: data
+                            .get("ReasonCode")
+                            .or_else(|| data.get("reasonCode"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        reason_detail: data
+                            .get("ReasonDescription")
+                            .or_else(|| data.get("errorMessage"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        updated_at_unix: now_unix_secs,
+                        source: IngestionSource::WebhookPush,
+                    },
+                )])
             }
             other => Err(anyhow!("unsupported OCBC webhook alertType '{}'", other)),
         }
@@ -463,85 +517,79 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
         cursor: &AccountPollCursor,
         now_unix_secs: u64,
     ) -> Result<IncomingPollBatch> {
-        let token = self.bearer_token(now_unix_secs).await?;
-        let url = format!(
-            "{}/transactional/transactionHistory/1.0",
-            self.cfg.base_url.trim_end_matches('/')
-        );
-        let req_body = serde_json::to_vec(&json!({
-            "AccountNo": account.external_account_number,
-            "CurrencyCode": account.currency.as_str(),
-            "SinceTimestamp": cursor.last_polled_unix,
-            "CursorToken": cursor.cursor_token,
-        }))?;
-        let resp = self
-            .transport
-            .execute(OutboundHttpRequest {
-                method: HttpMethod::Post,
-                url,
-                headers: vec![
-                    ("Authorization".into(), format!("Bearer {}", token)),
-                    ("client_id".into(), self.cfg.client_id.clone()),
-                    ("Content-Type".into(), "application/json".into()),
-                    ("Accept".into(), "application/json".into()),
-                ],
-                body: req_body,
-            })
+        // Use a safe 24h overlap from `last_polled_unix` (or 7 days on initial sync) because `fromDate`/`toDate` are day-granular (`dd-mm-yyyy`)!
+        let from_unix = if cursor.last_polled_unix > 86_400 {
+            cursor.last_polled_unix - 86_400
+        } else {
+            now_unix_secs.saturating_sub(7 * 86_400)
+        };
+
+        let history = self
+            .fetch_corp_trans_history(account, from_unix, now_unix_secs, now_unix_secs)
             .await?;
 
-        if !resp.is_success() {
-            return Err(anyhow!(
-                "OCBC transactionHistory poll failed with HTTP {}",
-                resp.status
-            ));
-        }
-
-        let val: serde_json::Value = resp.json()?;
-        let results = val.get("Results").unwrap_or(&val);
-        let txs = results
-            .get("Transactions")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
+        let mut occurrence_counter: HashMap<(String, String, i128, String), usize> = HashMap::new();
         let mut credits = Vec::new();
-        for item in &txs {
-            let drcr = item
-                .get("DrCrIndicator")
-                .and_then(|v| v.as_str())
-                .unwrap_or("C")
-                .to_ascii_uppercase();
-            if drcr != "C" && drcr != "CRDT" && drcr != "CREDIT" {
-                continue;
-            }
-            let status = item
-                .get("Status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("BOOKED")
-                .to_ascii_uppercase();
-            if !matches!(status.as_str(), "BOOKED" | "POSTED" | "APPLIED") {
-                continue;
-            }
-            credits.push(self.parse_credit_json(
-                item,
-                Some(&account.external_account_number),
-                Some(&account.currency),
-                IngestionSource::PeriodicPoll,
-                now_unix_secs,
-            )?);
-        }
 
-        let next_tok = results
-            .get("NextCursor")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| cursor.cursor_token.clone());
+        for row in &history.results {
+            if !Self::is_credit_indicator(&row.debitCreditIndicator) {
+                continue;
+            }
+            let ccy = CurrencyCode::new(&row.currencyCode)?;
+            if ccy != account.currency {
+                continue;
+            }
+            let minor = ccy.parse_decimal_to_minor(&row.amount)?;
+            if minor <= 0 {
+                continue;
+            }
+            let desc = row
+                .transactionDescription
+                .clone()
+                .unwrap_or_default();
+            let occ_key = (
+                row.transactionDate.trim().to_string(),
+                ccy.as_str().to_string(),
+                minor,
+                desc.trim().to_string(),
+            );
+            let occ_idx = *occurrence_counter
+                .entry(occ_key)
+                .and_modify(|n| *n += 1)
+                .or_insert(0);
+
+            let tx_id = Self::deterministic_entry_tx_id(
+                &account.external_account_number,
+                row,
+                minor,
+                occ_idx,
+            );
+
+            credits.push(AppliedCreditEvent {
+                bank_adapter_id: self.cfg.adapter_id.clone(),
+                external_account_number: account.external_account_number.clone(),
+                bank_tx_id: tx_id,
+                end_to_end_id: None,
+                batch_or_sweep_ref: row.batchReference.clone(),
+                rail: TransferRail::Fast,
+                amount: Money::new(minor, ccy),
+                value_date: row.transactionDate.clone(),
+                booked_at_unix: now_unix_secs,
+                structured_invoice_id: Self::extract_invoice_id(&desc),
+                remittance_info: desc,
+                payer_name: None,
+                payer_account: None,
+                voucher_metadata: None,
+                running_balance_minor: None,
+                source: IngestionSource::PeriodicPoll,
+            });
+        }
 
         Ok(IncomingPollBatch {
             applied_credits: credits,
             next_cursor: AccountPollCursor {
                 last_polled_unix: now_unix_secs,
-                cursor_token: next_tok,
+                cursor_token: None,
             },
         })
     }
@@ -552,19 +600,23 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
         instruction: &OutboundPaymentInstruction,
         now_unix_secs: u64,
     ) -> Result<OutboundSubmissionReceipt> {
-        let token = self.bearer_token(now_unix_secs).await?;
-        let endpoint_slug = match &instruction.rail {
-            TransferRail::Fast => "fastpayment/1.0",
-            TransferRail::PayNow => "paynow/1.0",
-            TransferRail::MepsPlus => "meps/1.0",
-            TransferRail::Giro => "giro/1.0",
-            TransferRail::SwiftGpi => "tt/1.0",
-            _ => "internaltransfer/1.0",
+        let Some(init_path) = &self.cfg.outbound_initiation_path else {
+            return Err(anyhow!(
+                "OCBC corporate outbound initiation path is not configured (set ocbc_corporate.outbound_initiation_path once corporate FAST/GIRO/MEPS initiation API subscription is enabled)"
+            ));
         };
+        let tok = self
+            .token_vault
+            .resolve_token(Some(&account.account_id), now_unix_secs)?;
+        self.rate_limiter
+            .acquire_slot(&tok.access_token, now_unix_secs)
+            .await?;
+
         let url = format!(
-            "{}/transactional/{}",
+            "{}/{}?sessionToken={}",
             self.cfg.base_url.trim_end_matches('/'),
-            endpoint_slug
+            init_path.trim_start_matches('/'),
+            tok.session_token_url_encoded(),
         );
         let decimals = instruction.amount.currency.minor_decimals() as usize;
         let factor = 10f64.powi(decimals as i32);
@@ -575,14 +627,14 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
         );
 
         let body = serde_json::to_vec(&json!({
-            "ClientRef": instruction.client_instruction_id,
-            "DebitAccountNo": account.external_account_number,
-            "CurrencyCode": instruction.amount.currency.as_str(),
-            "Amount": amt_str,
-            "BeneficiaryName": instruction.beneficiary_name,
-            "BeneficiaryAccountNo": instruction.beneficiary_account,
-            "BeneficiaryBankBic": instruction.beneficiary_bank_bic,
-            "RemittanceInfo": instruction.remittance_info,
+            "clientRef": instruction.client_instruction_id,
+            "accountId": account.external_account_number,
+            "currencyCode": instruction.amount.currency.as_str(),
+            "amount": amt_str,
+            "beneficiaryName": instruction.beneficiary_name,
+            "beneficiaryAccountNo": instruction.beneficiary_account,
+            "beneficiaryBankBic": instruction.beneficiary_bank_bic,
+            "remittanceInfo": instruction.remittance_info,
         }))?;
 
         let resp = self
@@ -591,9 +643,9 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
                 method: HttpMethod::Post,
                 url,
                 headers: vec![
-                    ("Authorization".into(), format!("Bearer {}", token)),
-                    ("client_id".into(), self.cfg.client_id.clone()),
+                    ("Authorization".into(), tok.authorization_bearer_header()),
                     ("Content-Type".into(), "application/json".into()),
+                    ("Accept".into(), "application/json".into()),
                 ],
                 body,
             })
@@ -601,29 +653,27 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
 
         if !resp.is_success() {
             return Err(anyhow!(
-                "OCBC outbound payment submission failed with HTTP {}",
+                "OCBC outbound initiation failed with HTTP {}",
                 resp.status
             ));
         }
 
         let val: serde_json::Value = resp.json()?;
-        let res = val.get("Results").unwrap_or(&val);
-        let state_str = res
-            .get("PaymentStatus")
+        let res = val.get("results").or_else(|| val.get("Results")).unwrap_or(&val);
+        let st_str = res
+            .get("paymentStatus")
+            .or_else(|| res.get("PaymentStatus"))
             .and_then(|v| v.as_str())
             .unwrap_or("ACCP");
 
         Ok(OutboundSubmissionReceipt {
             bank_payment_id: res
-                .get("BankPaymentId")
-                .or_else(|| res.get("TransactionRef"))
+                .get("transactionId")
+                .or_else(|| res.get("BankPaymentId"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            end_to_end_id: res
-                .get("EndToEndId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            initial_state: Self::map_ocbc_outbound_state(state_str)?,
+                .map(String::from),
+            end_to_end_id: res.get("endToEndId").and_then(|v| v.as_str()).map(String::from),
+            initial_state: Self::map_ocbc_outbound_state(st_str)?,
         })
     }
 
@@ -633,86 +683,117 @@ impl BankTechnicalAdapter for OcbcCorporateBankAdapter {
         tracker: &OutboundPaymentTracker,
         now_unix_secs: u64,
     ) -> Result<OutboundPaymentStatusEvent> {
-        let now = if now_unix_secs == 0 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        } else {
-            now_unix_secs
-        };
-        let token = self.bearer_token(now).await?;
-        let url = format!(
-            "{}/transactional/paymentInquiry/1.0",
-            self.cfg.base_url.trim_end_matches('/')
-        );
-        let body = serde_json::to_vec(&json!({
-            "AccountNo": account.external_account_number,
-            "ClientRef": tracker.client_instruction_id,
-            "BankPaymentId": tracker.bank_payment_id,
-        }))?;
-        let resp = self
-            .transport
-            .execute(OutboundHttpRequest {
-                method: HttpMethod::Post,
-                url,
-                headers: vec![
-                    ("Authorization".into(), format!("Bearer {}", token)),
-                    ("client_id".into(), self.cfg.client_id.clone()),
-                    ("Content-Type".into(), "application/json".into()),
-                ],
-                body,
-            })
-            .await?;
-
-        if !resp.is_success() {
-            return Err(anyhow!(
-                "OCBC paymentInquiry failed with HTTP {}",
-                resp.status
-            ));
+        if let Some(inq_path) = &self.cfg.outbound_inquiry_path {
+            let tok = self
+                .token_vault
+                .resolve_token(Some(&account.account_id), now_unix_secs)?;
+            self.rate_limiter
+                .acquire_slot(&tok.access_token, now_unix_secs)
+                .await?;
+            let url = format!(
+                "{}/{}?sessionToken={}",
+                self.cfg.base_url.trim_end_matches('/'),
+                inq_path.trim_start_matches('/'),
+                tok.session_token_url_encoded()
+            );
+            let body = serde_json::to_vec(&json!({
+                "accountId": account.external_account_number,
+                "clientRef": tracker.client_instruction_id,
+                "transactionId": tracker.bank_payment_id,
+            }))?;
+            let resp = self
+                .transport
+                .execute(OutboundHttpRequest {
+                    method: HttpMethod::Post,
+                    url,
+                    headers: vec![
+                        ("Authorization".into(), tok.authorization_bearer_header()),
+                        ("Content-Type".into(), "application/json".into()),
+                        ("Accept".into(), "application/json".into()),
+                    ],
+                    body,
+                })
+                .await?;
+            if !resp.is_success() {
+                return Err(anyhow!("OCBC outbound inquiry HTTP {}", resp.status));
+            }
+            let val: serde_json::Value = resp.json()?;
+            let res = val.get("results").or_else(|| val.get("Results")).unwrap_or(&val);
+            let st_str = res
+                .get("paymentStatus")
+                .or_else(|| res.get("PaymentStatus"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("PDNG");
+            return Ok(OutboundPaymentStatusEvent {
+                bank_adapter_id: self.cfg.adapter_id.clone(),
+                external_account_number: account.external_account_number.clone(),
+                client_instruction_id: tracker.client_instruction_id.clone(),
+                bank_payment_id: tracker.bank_payment_id.clone(),
+                end_to_end_id: tracker.end_to_end_id.clone(),
+                rail: tracker.rail.clone(),
+                state: Self::map_ocbc_outbound_state(st_str)?,
+                amount: tracker.amount.clone(),
+                bank_fee_minor: 0,
+                reason_code: None,
+                reason_detail: None,
+                updated_at_unix: now_unix_secs,
+                source: IngestionSource::PeriodicPoll,
+            });
         }
 
-        let val: serde_json::Value = resp.json()?;
-        let res = val.get("Results").unwrap_or(&val);
-        let state_str = res
-            .get("PaymentStatus")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing PaymentStatus in OCBC paymentInquiry response"))?;
-        let fee_minor = if let Some(m) = res.get("feeMinor").and_then(|v| v.as_i64()) {
-            m as i128
-        } else if let Some(s) = res.get("BankFee").and_then(|v| v.as_str()) {
-            tracker.amount.currency.parse_decimal_to_minor(s)?
+        // Fallback using the documented `GET /transactional/corpTransHistory/1.0` debit rows (`debitCreditIndicator == "D"`):
+        let history = self
+            .fetch_corp_trans_history(
+                account,
+                tracker.created_at_unix.saturating_sub(86_400),
+                now_unix_secs,
+                now_unix_secs,
+            )
+            .await?;
+
+        let matched_debit = history.results.iter().find(|row| {
+            if !Self::is_debit_indicator(&row.debitCreditIndicator) {
+                return false;
+            }
+            let Ok(ccy) = CurrencyCode::new(&row.currencyCode) else {
+                return false;
+            };
+            let Ok(minor) = ccy.parse_decimal_to_minor(&row.amount) else {
+                return false;
+            };
+            if ccy != tracker.amount.currency || minor != tracker.amount.amount_minor {
+                return false;
+            }
+            if let Some(cref) = &row.clientRef {
+                return cref == &tracker.client_instruction_id;
+            }
+            if let Some(desc) = &row.transactionDescription {
+                return desc.contains(&tracker.client_instruction_id)
+                    || (!tracker.remittance_info.is_empty()
+                        && desc.contains(&tracker.remittance_info));
+            }
+            true
+        });
+
+        let resolved_state = if matched_debit.is_some() {
+            OutboundPaymentState::Settled
         } else {
-            0
+            tracker.state
         };
 
         Ok(OutboundPaymentStatusEvent {
             bank_adapter_id: self.cfg.adapter_id.clone(),
             external_account_number: account.external_account_number.clone(),
             client_instruction_id: tracker.client_instruction_id.clone(),
-            bank_payment_id: res
-                .get("BankPaymentId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| tracker.bank_payment_id.clone()),
-            end_to_end_id: res
-                .get("EndToEndId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| tracker.end_to_end_id.clone()),
+            bank_payment_id: tracker.bank_payment_id.clone(),
+            end_to_end_id: tracker.end_to_end_id.clone(),
             rail: tracker.rail.clone(),
-            state: Self::map_ocbc_outbound_state(state_str)?,
+            state: resolved_state,
             amount: tracker.amount.clone(),
-            bank_fee_minor: fee_minor,
-            reason_code: res
-                .get("ReasonCode")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            reason_detail: res
-                .get("ReasonDescription")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            updated_at_unix: now,
+            bank_fee_minor: 0,
+            reason_code: None,
+            reason_detail: None,
+            updated_at_unix: now_unix_secs,
             source: IngestionSource::PeriodicPoll,
         })
     }

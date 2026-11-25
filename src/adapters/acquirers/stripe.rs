@@ -335,7 +335,11 @@ impl PaymentAcquirerAdapter for StripeAcquirerAdapter {
                 .or_else(|| val["id"].as_str())
                 .ok_or_else(|| anyhow!("missing payment_intent/id in Stripe session"))?
                 .to_string(),
+            auth_id: None,
+            response_code: None,
+            txn_status: val["payment_status"].as_str().map(String::from),
             checkout_url_or_token: val["url"].as_str().unwrap_or("").to_string(),
+            immediate_event: None,
             created_at_unix: now_unix_secs,
         })
     }
