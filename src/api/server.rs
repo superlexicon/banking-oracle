@@ -22,8 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::Html,
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -34,14 +35,17 @@ use crate::adapters::ocbc_auth::{
     build_ocbc_oauth_authorize_url, parse_ocbc_oauth_fragment, OcbcSessionTokenRecord,
     OcbcTokenVault,
 };
-use crate::crypto::constant_time_eq;
+use crate::crypto::{constant_time_eq, hmac_sha256, keccak256};
 use crate::domain::entities::{AccountOwner, BankAccount, Counterparty, MerchantProfile};
-use crate::domain::events::{AcquirerSettlementBatch, CanonicalAcquirerEvent};
+use crate::domain::events::{AcquirerSettlementBatch, CanonicalAcquirerEvent, VoucherOrderMetadata};
+use crate::domain::ledger::{ClearingItemStatus, PreorderAuthorizationRecord, PreorderLifecycleStatus};
 use crate::domain::money::Money;
 use crate::engine::chain_relayer::ChainOutboxRelayer;
 use crate::engine::poller::PollingSupervisor;
 use crate::engine::reconciliation::ReconciliationEngine;
-use crate::ports::acquirer_adapter::{MerchantPaymentRequest, PaymentAcquirerAdapter};
+use crate::ports::acquirer_adapter::{
+    CardCaptureMode, MerchantPaymentRequest, PaymentAcquirerAdapter,
+};
 use crate::ports::bank_adapter::{
     BankTechnicalAdapter, DirectCollectionInstruction, OutboundPaymentInstruction,
 };
@@ -83,6 +87,91 @@ pub struct CaptureOrVoidMerchantCardRequest {
     pub transaction_id: String,
     pub merchant_tran_id: String,
     pub amount: Money,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PublicPreorderAuthorizeRequest {
+    pub merchant_profile_id: Option<String>,
+    pub order_reference: Option<String>,
+    pub identity_addr: String,
+    #[serde(default)]
+    pub nickname: String,
+    pub full_name: String,
+    pub billing_address: String,
+    pub shipping_address: String,
+    #[serde(default = "default_sku_code")]
+    pub sku_code: u64,
+    #[serde(default = "default_qty_one")]
+    pub quantity: u64,
+    #[serde(default = "default_ks_tier_bps")]
+    pub tier_bps: u64,
+    pub amount: Money,
+    #[serde(default)]
+    pub description: String,
+    pub voucher_commitment: String,
+    pub agreement_version: String,
+    pub agreement_hash: String,
+    pub agreement_accepted: bool,
+    #[serde(default)]
+    pub is_dollar_test: bool,
+    pub return_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PublicPreorderCancelRequest {
+    pub order_reference: String,
+    pub cancel_token: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BatchCapturePreordersRequest {
+    pub merchant_profile_id: Option<String>,
+}
+
+fn default_sku_code() -> u64 {
+    1
+}
+
+fn default_qty_one() -> u64 {
+    1
+}
+
+fn default_ks_tier_bps() -> u64 {
+    2_000
+}
+
+fn derive_preorder_cancel_token(secret: &str, payment_id: &str, order_ref: &str) -> String {
+    let msg = format!("preorder_cancel:v1:{}:{}", payment_id, order_ref);
+    hex::encode(hmac_sha256(secret.as_bytes(), msg.as_bytes()))
+}
+
+async fn cors_middleware<B>(req: Request<B>, next: Next<B>) -> Response {
+    if req.method() == Method::OPTIONS {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        let h = resp.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, OPTIONS"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Content-Type, Authorization"),
+        );
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Content-Type, Authorization"),
+    );
+    resp
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -175,12 +264,25 @@ pub fn build_oracle_router(state: Arc<OracleApiState>) -> Router {
             "/v1/payments/merchant/void",
             post(handle_void_merchant_payment),
         )
+        .route(
+            "/v1/public/preorders/authorize",
+            post(handle_public_preorder_authorize),
+        )
+        .route(
+            "/v1/public/preorders/cancel",
+            post(handle_public_preorder_cancel),
+        )
+        .route(
+            "/v1/payments/preorders/capture-batch",
+            post(handle_batch_capture_preorders),
+        )
         .route("/v1/admin/poll-now", post(handle_poll_now))
         .route(
             "/v1/entities/:entity_id/trial-balance",
             get(handle_entity_trial_balance),
         )
         .route("/v1/reconciliation/state", get(handle_reconciliation_state))
+        .layer(middleware::from_fn(cors_middleware))
         .with_state(state)
 }
 
@@ -862,7 +964,426 @@ async fn handle_reconciliation_state(
             "sweepBatches": s.sweep_batches,
             "journals": s.journals,
             "outbox": s.outbox,
+            "preorders": s.preorders,
         })
     });
     (StatusCode::OK, Json(snap))
+}
+
+async fn handle_public_preorder_authorize(
+    State(st): State<Arc<OracleApiState>>,
+    Json(req): Json<PublicPreorderAuthorizeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !req.agreement_accepted
+        || req.agreement_version.trim().is_empty()
+        || req.agreement_hash.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Pre-Order Agreement must be explicitly reviewed and accepted before requesting Airwallex authorization."
+            })),
+        );
+    }
+    let id_addr = req.identity_addr.trim().to_ascii_lowercase();
+    if !id_addr.starts_with("0x") || id_addr.len() != 42 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "A valid 20-byte Identity HFS address (0x...) is required." })),
+        );
+    }
+    if req.full_name.trim().is_empty()
+        || req.billing_address.trim().is_empty()
+        || req.shipping_address.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Full Name (as per credit card), Billing Address, and Shipping Address are required."
+            })),
+        );
+    }
+    if req.amount.amount_minor <= 0 || req.quantity == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Order amount and quantity must be positive." })),
+        );
+    }
+
+    let merchant = st.engine.store().read(|s| {
+        if let Some(ref pid) = req.merchant_profile_id {
+            if let Some(m) = s.merchant_profiles.get(pid) {
+                return Some(m.clone());
+            }
+        }
+        s.merchant_profiles
+            .values()
+            .find(|m| m.acquirer_adapter_id == "airwallex")
+            .or_else(|| s.merchant_profiles.values().next())
+            .cloned()
+    });
+    let Some(merchant) = merchant else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "No active Airwallex merchant profile configured in banking-oracle yet."
+            })),
+        );
+    };
+    let Some(adapter) = st.acquirer_adapters.get(&merchant.acquirer_adapter_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Acquirer adapter '{}' not registered", merchant.acquirer_adapter_id)
+            })),
+        );
+    };
+
+    let now = unix_now();
+    let order_ref = req
+        .order_reference
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            let dig = keccak256(
+                format!("{}:{}:{}:{}", id_addr, req.sku_code, req.quantity, now).as_bytes(),
+            );
+            format!("SLX-PRE-{}", &hex::encode(dig)[..12].to_ascii_uppercase())
+        });
+
+    let is_smoke = req.is_dollar_test && req.amount.amount_minor <= 200;
+    let capture_mode = if is_smoke {
+        CardCaptureMode::ImmediateSale
+    } else {
+        CardCaptureMode::AuthorizeOnly
+    };
+
+    let desc = if !req.description.trim().is_empty() {
+        req.description.clone()
+    } else if is_smoke {
+        "Superlexicon $1 Oracle Test".to_string()
+    } else {
+        format!("Superlexicon PreOrder SKU{}x{}", req.sku_code, req.quantity)
+    };
+
+    let voucher_meta = if req.voucher_commitment.trim().starts_with("0x")
+        && req.voucher_commitment.trim().len() == 66
+    {
+        Some(VoucherOrderMetadata {
+            sku_code: req.sku_code,
+            tier_bps: req.tier_bps,
+            voucher_commitment_hex: req.voucher_commitment.trim().to_ascii_lowercase(),
+            explicit_price_usd_micros: Some((req.amount.amount_minor as u64).saturating_mul(10_000)),
+        })
+    } else {
+        None
+    };
+
+    let acq_extra = json!({
+        "metadata": {
+            "order_ref": order_ref,
+            "capture_mode": if is_smoke { "immediate_sale" } else { "authorize_only" },
+            "identity_hfs": id_addr,
+            "nickname": req.nickname.trim(),
+            "cardholder_full_name": req.full_name.trim(),
+            "billing_address": req.billing_address.trim(),
+            "shipping_address": req.shipping_address.trim(),
+            "agreement_version": req.agreement_version.trim(),
+            "agreement_hash": req.agreement_hash.trim(),
+            "sku": req.sku_code.to_string(),
+            "qty": req.quantity.to_string(),
+            "voucher_commitment": req.voucher_commitment.trim(),
+        }
+    });
+
+    let pay_req = MerchantPaymentRequest {
+        order_reference: order_ref.clone(),
+        customer_id: None,
+        amount: req.amount.clone(),
+        description: desc,
+        capture_mode,
+        acquirer_specific_payload: acq_extra,
+        success_url: req.return_url.clone(),
+        cancel_url: req.return_url,
+        structured_invoice_id: None,
+        voucher_metadata: voucher_meta,
+    };
+
+    match adapter.create_payment_session(&merchant, &pay_req, now).await {
+        Ok(mut session) => {
+            let mut outcome = None;
+            if let Some(ev) = session.immediate_event.take() {
+                if let Ok(o) = st.engine.ingest_acquirer_event(ev, now) {
+                    outcome = Some(o);
+                }
+            }
+            let init_status = if is_smoke {
+                PreorderLifecycleStatus::CapturedNonCancelable
+            } else {
+                PreorderLifecycleStatus::AuthorizedHold
+            };
+            let cancel_token = derive_preorder_cancel_token(
+                &st.admin_bearer_token,
+                &session.acquirer_payment_id,
+                &order_ref,
+            );
+            let rec = PreorderAuthorizationRecord {
+                order_reference: order_ref.clone(),
+                merchant_profile_id: merchant.merchant_profile_id.clone(),
+                acquirer_payment_id: session.acquirer_payment_id.clone(),
+                identity_addr: id_addr,
+                nickname: req.nickname.trim().to_string(),
+                full_name: req.full_name.trim().to_string(),
+                billing_address: req.billing_address.trim().to_string(),
+                shipping_address: req.shipping_address.trim().to_string(),
+                sku_code: req.sku_code,
+                quantity: req.quantity,
+                amount: req.amount,
+                voucher_commitment: req.voucher_commitment.trim().to_string(),
+                agreement_version: req.agreement_version,
+                agreement_hash: req.agreement_hash,
+                is_dollar_test: is_smoke,
+                status: init_status,
+                created_at_unix: now,
+                updated_at_unix: now,
+            };
+            let _ = st.engine.store().write(|s| {
+                s.preorders.insert(order_ref.clone(), rec);
+                Ok(())
+            });
+            let payment_ref_hash = format!(
+                "0x{}",
+                hex::encode(keccak256(
+                    format!("{}:{}", merchant.acquirer_adapter_id, session.acquirer_payment_id)
+                        .as_bytes()
+                ))
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "orderReference": order_ref,
+                    "acquirerId": session.acquirer_id,
+                    "paymentIntentId": session.acquirer_payment_id,
+                    "clientSecretOrUrl": session.checkout_url_or_token,
+                    "captureMode": if is_smoke { "immediate_sale" } else { "authorize_only" },
+                    "cancelToken": cancel_token,
+                    "paymentRefHash": payment_ref_hash,
+                    "clearingOutcome": outcome,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn handle_public_preorder_cancel(
+    State(st): State<Arc<OracleApiState>>,
+    Json(req): Json<PublicPreorderCancelRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ord_key = req.order_reference.trim();
+    let rec_opt = st
+        .engine
+        .store()
+        .read(|s| s.preorders.get(ord_key).cloned());
+    let Some(rec) = rec_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown pre-order reference '{}'", ord_key) })),
+        );
+    };
+
+    let expected_tok = derive_preorder_cancel_token(
+        &st.admin_bearer_token,
+        &rec.acquirer_payment_id,
+        &rec.order_reference,
+    );
+    if !constant_time_eq(req.cancel_token.trim().as_bytes(), expected_tok.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid pre-order cancellation token" })),
+        );
+    }
+
+    if rec.status == PreorderLifecycleStatus::CapturedNonCancelable {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Card has already been charged after reaching the minimum campaign target. Self-cancellation is disabled after capture; refunds are at the sole discretion of Superlexicon Pte. Ltd."
+            })),
+        );
+    }
+    if rec.status == PreorderLifecycleStatus::CanceledPriorToCapture {
+        return (
+            StatusCode::OK,
+            Json(json!({ "status": "already_canceled", "orderReference": rec.order_reference })),
+        );
+    }
+
+    let already_captured_in_clearing = st.engine.store().read(|s| {
+        s.clearing_items.values().any(|item| {
+            item.acquirer_payment_id == rec.acquirer_payment_id
+                && matches!(
+                    item.status,
+                    ClearingItemStatus::CapturedPendingBankSweep
+                        | ClearingItemStatus::BankCashFinalized { .. }
+                )
+        })
+    });
+    if already_captured_in_clearing {
+        let _ = st.engine.store().write(|s| {
+            if let Some(p) = s.preorders.get_mut(&rec.order_reference) {
+                p.status = PreorderLifecycleStatus::CapturedNonCancelable;
+            }
+            Ok(())
+        });
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Card has already been charged. Refunds after capture are at the sole discretion of Superlexicon Pte. Ltd."
+            })),
+        );
+    }
+
+    let Some(merchant) = st
+        .engine
+        .store()
+        .read(|s| s.merchant_profiles.get(&rec.merchant_profile_id).cloned())
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "merchant profile missing" })),
+        );
+    };
+    let Some(adapter) = st.acquirer_adapters.get(&merchant.acquirer_adapter_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "acquirer adapter missing" })),
+        );
+    };
+
+    let now = unix_now();
+    match adapter
+        .void_payment(
+            &merchant,
+            &rec.acquirer_payment_id,
+            &rec.order_reference,
+            &rec.amount,
+            now,
+        )
+        .await
+    {
+        Ok(ev) => {
+            let _ = st.engine.ingest_acquirer_event(ev, now);
+            let _ = st.engine.store().write(|s| {
+                if let Some(p) = s.preorders.get_mut(&rec.order_reference) {
+                    p.status = PreorderLifecycleStatus::CanceledPriorToCapture;
+                    p.updated_at_unix = now;
+                }
+                Ok(())
+            });
+            let relayed = st.relayer.flush_pending_outbox(now).await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "canceled_prior_to_capture",
+                    "chargedAmount": 0,
+                    "orderReference": rec.order_reference,
+                    "paymentIntentId": rec.acquirer_payment_id,
+                    "relayedOnChainTasks": relayed,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn handle_batch_capture_preorders(
+    State(st): State<Arc<OracleApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<BatchCapturePreordersRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(resp) = check_admin_auth(&headers, &st.admin_bearer_token) {
+        return resp;
+    }
+    let pending: Vec<PreorderAuthorizationRecord> = st.engine.store().read(|s| {
+        s.preorders
+            .values()
+            .filter(|p| {
+                p.status == PreorderLifecycleStatus::AuthorizedHold
+                    && req
+                        .merchant_profile_id
+                        .as_ref()
+                        .map(|id| &p.merchant_profile_id == id)
+                        .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    });
+
+    let now = unix_now();
+    let mut captured = Vec::new();
+    let mut errors = Vec::new();
+
+    for p in pending {
+        let Some(merchant) = st
+            .engine
+            .store()
+            .read(|s| s.merchant_profiles.get(&p.merchant_profile_id).cloned())
+        else {
+            continue;
+        };
+        let Some(adapter) = st.acquirer_adapters.get(&merchant.acquirer_adapter_id) else {
+            continue;
+        };
+        match adapter
+            .capture_authorized_payment(
+                &merchant,
+                &p.acquirer_payment_id,
+                &p.order_reference,
+                &p.amount,
+                now,
+            )
+            .await
+        {
+            Ok(ev) => {
+                let _ = st.engine.ingest_acquirer_event(ev, now);
+                let _ = st.engine.store().write(|s| {
+                    if let Some(rec) = s.preorders.get_mut(&p.order_reference) {
+                        rec.status = PreorderLifecycleStatus::CapturedNonCancelable;
+                        rec.updated_at_unix = now;
+                    }
+                    Ok(())
+                });
+                captured.push(json!({
+                    "orderReference": p.order_reference,
+                    "paymentIntentId": p.acquirer_payment_id,
+                    "amount": p.amount,
+                }));
+            }
+            Err(e) => {
+                errors.push(json!({
+                    "orderReference": p.order_reference,
+                    "paymentIntentId": p.acquirer_payment_id,
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
+    let relayed = st.relayer.flush_pending_outbox(now).await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "capturedCount": captured.len(),
+            "captured": captured,
+            "errors": errors,
+            "relayedOnChainTasks": relayed,
+        })),
+    )
 }

@@ -332,3 +332,39 @@ pub struct OnChainOutboxTask {
     pub state: OutboxTaskState,
     pub created_at_unix: u64,
 }
+
+/// Lifecycle state of an Airwallex hardware pre-order authorization hold:
+/// - `AuthorizedHold`: Credit authorization hold ONLY (`auto_capture: false`); buyer may cancel anytime (`$0` charged).
+/// - `CanceledPriorToCapture`: Canceled by buyer or released before capture (`$0` charged).
+/// - `CapturedNonCancelable`: Card charged after campaign minimum target met; buyer self-cancellation locked (refunds at sole discretion of Superlexicon Pte. Ltd.).
+/// - `RefundedCompanyDiscretion`: Post-capture refund granted at the sole discretion of the company.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreorderLifecycleStatus {
+    AuthorizedHold,
+    CanceledPriorToCapture,
+    CapturedNonCancelable,
+    RefundedCompanyDiscretion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreorderAuthorizationRecord {
+    pub order_reference: String,
+    pub merchant_profile_id: String,
+    pub acquirer_payment_id: String,
+    pub identity_addr: String,
+    pub nickname: String,
+    pub full_name: String,
+    pub billing_address: String,
+    pub shipping_address: String,
+    pub sku_code: u64,
+    pub quantity: u64,
+    pub amount: Money,
+    pub voucher_commitment: String,
+    pub agreement_version: String,
+    pub agreement_hash: String,
+    pub is_dollar_test: bool,
+    pub status: PreorderLifecycleStatus,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+}

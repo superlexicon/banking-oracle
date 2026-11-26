@@ -15,7 +15,7 @@ use crate::domain::entities::{AccountOwner, BankAccount, Counterparty, MerchantP
 use crate::domain::ledger::{
     AcquirerClearingItem, BankCreditRecord, DirectCollectionTracker, EntrySide,
     LedgerJournalEntry, OnChainOutboxTask, OutboxTaskState, OutboundPaymentTracker,
-    PendingSweepRecord, SubledgerAccountCode,
+    PendingSweepRecord, PreorderAuthorizationRecord, SubledgerAccountCode,
 };
 use crate::domain::money::CurrencyCode;
 use crate::ports::acquirer_adapter::AcquirerPollCursor;
@@ -40,6 +40,8 @@ pub struct StoreSnapshot {
     pub outbox_dedup: HashSet<String>,
     #[serde(default)]
     pub ocbc_tokens: BTreeMap<String, OcbcSessionTokenRecord>,
+    #[serde(default)]
+    pub preorders: IndexMap<String, PreorderAuthorizationRecord>,
 }
 
 /// Per-account trial balance row (`debit_minor`, `credit_minor`, `net_dr_minus_cr_minor`).
