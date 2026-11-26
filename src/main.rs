@@ -11,10 +11,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use banking_oracle::adapters::acquirers::{
-    OcbcMerchantCardAdapter, OcbcMerchantCardConfig, StripeAcquirerAdapter, StripeAcquirerConfig,
+    AirwallexAcquirerAdapter, AirwallexAcquirerConfig, OcbcMerchantCardAdapter,
+    OcbcMerchantCardConfig, StripeAcquirerAdapter, StripeAcquirerConfig,
 };
+use banking_oracle::adapters::airwallex_auth::AirwallexTokenManager;
 use banking_oracle::adapters::banks::{
-    Iso20022BankAdapter, Iso20022BankConfig, OcbcCorporateBankAdapter, OcbcCorporateConfig,
+    AirwallexBankAdapter, AirwallexBankConfig, Iso20022BankAdapter, Iso20022BankConfig,
+    OcbcCorporateBankAdapter, OcbcCorporateConfig,
 };
 use banking_oracle::adapters::ocbc_auth::{OcbcRateLimiter, OcbcTokenVault};
 use banking_oracle::api::{build_oracle_router, OracleApiState};
@@ -39,9 +42,13 @@ pub struct OracleDaemonConfig {
     #[serde(default)]
     pub ocbc_corporate: OcbcCorporateConfig,
     #[serde(default)]
+    pub airwallex_bank: AirwallexBankConfig,
+    #[serde(default)]
     pub iso20022_banks: Vec<Iso20022BankConfig>,
     #[serde(default)]
     pub ocbc_merchant_card: OcbcMerchantCardConfig,
+    #[serde(default)]
+    pub airwallex: AirwallexAcquirerConfig,
     #[serde(default)]
     pub stripe: StripeAcquirerConfig,
     #[serde(default)]
@@ -69,8 +76,10 @@ impl Default for OracleDaemonConfig {
             poll_interval_secs: 30,
             outbox_flush_interval_secs: 5,
             ocbc_corporate: OcbcCorporateConfig::default(),
+            airwallex_bank: AirwallexBankConfig::default(),
             iso20022_banks: vec![],
             ocbc_merchant_card: OcbcMerchantCardConfig::default(),
+            airwallex: AirwallexAcquirerConfig::default(),
             stripe: StripeAcquirerConfig::default(),
             bootstrap_entities: vec![],
             bootstrap_bank_accounts: vec![],
@@ -135,6 +144,40 @@ async fn main() -> Result<()> {
         cfg.ocbc_corporate.max_calls_per_minute,
     ));
 
+    let mut awx_bank_cfg = cfg.airwallex_bank.clone();
+    let mut awx_acq_cfg = cfg.airwallex.clone();
+    if let Ok(cid) = std::env::var("AIRWALLEX_CLIENT_ID") {
+        awx_bank_cfg.auth.client_id = cid.clone();
+        awx_acq_cfg.auth.client_id = cid;
+    }
+    if let Ok(key) = std::env::var("AIRWALLEX_API_KEY") {
+        awx_bank_cfg.auth.api_key = key.clone();
+        awx_acq_cfg.auth.api_key = key;
+    }
+    if let Ok(whs) = std::env::var("AIRWALLEX_WEBHOOK_SECRET") {
+        awx_bank_cfg.auth.webhook_secret = whs.clone();
+        awx_acq_cfg.auth.webhook_secret = whs;
+    }
+    if let Ok(base) = std::env::var("AIRWALLEX_BASE_URL") {
+        awx_bank_cfg.auth.base_url = base.clone();
+        awx_acq_cfg.auth.base_url = base;
+    }
+    let awx_bank_token_mgr = Arc::new(AirwallexTokenManager::new(
+        awx_bank_cfg.auth.clone(),
+        transport.clone(),
+    ));
+    let awx_acq_token_mgr = if awx_acq_cfg.auth.client_id == awx_bank_cfg.auth.client_id
+        && awx_acq_cfg.auth.api_key == awx_bank_cfg.auth.api_key
+        && awx_acq_cfg.auth.base_url == awx_bank_cfg.auth.base_url
+    {
+        awx_bank_token_mgr.clone()
+    } else {
+        Arc::new(AirwallexTokenManager::new(
+            awx_acq_cfg.auth.clone(),
+            transport.clone(),
+        ))
+    };
+
     let mut bank_map: HashMap<String, Arc<dyn BankTechnicalAdapter>> = HashMap::new();
     let ocbc_corp = Arc::new(OcbcCorporateBankAdapter::new(
         cfg.ocbc_corporate.clone(),
@@ -143,6 +186,13 @@ async fn main() -> Result<()> {
         ocbc_rate_limiter.clone(),
     ));
     bank_map.insert(ocbc_corp.adapter_id().to_string(), ocbc_corp);
+
+    let awx_bank = Arc::new(AirwallexBankAdapter::new(
+        awx_bank_cfg,
+        awx_bank_token_mgr,
+        transport.clone(),
+    ));
+    bank_map.insert(awx_bank.adapter_id().to_string(), awx_bank);
 
     for iso_cfg in cfg.iso20022_banks {
         let iso_adapter = Arc::new(Iso20022BankAdapter::new(iso_cfg, transport.clone()));
@@ -157,6 +207,13 @@ async fn main() -> Result<()> {
         ocbc_rate_limiter.clone(),
     ));
     acq_map.insert(ocbc_card.acquirer_id().to_string(), ocbc_card);
+
+    let awx_acq = Arc::new(AirwallexAcquirerAdapter::new(
+        awx_acq_cfg,
+        awx_acq_token_mgr,
+        transport.clone(),
+    ));
+    acq_map.insert(awx_acq.acquirer_id().to_string(), awx_acq);
 
     let stripe = Arc::new(StripeAcquirerAdapter::new(
         cfg.stripe.clone(),

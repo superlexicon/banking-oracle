@@ -1751,3 +1751,486 @@ async fn official_ocbc_meps_initiation_status_polling_and_paynow_uen_collection_
         34_900
     );
 }
+
+#[tokio::test]
+async fn test_airwallex_foreign_usd_crowdfunding_hold_capture_sweep_and_supplier_payout() {
+    use banking_oracle::adapters::acquirers::{AirwallexAcquirerAdapter, AirwallexAcquirerConfig};
+    use banking_oracle::adapters::airwallex_auth::{AirwallexAuthConfig, AirwallexTokenManager};
+    use banking_oracle::adapters::banks::{AirwallexBankAdapter, AirwallexBankConfig};
+    use banking_oracle::adapters::ocbc_auth::OcbcTokenVault;
+    use banking_oracle::ports::acquirer_adapter::{CardCaptureMode, MerchantPaymentRequest};
+
+    let transport = Arc::new(MockHttpTransport::new());
+    let store = Arc::new(OracleStore::in_memory());
+    let now: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut ledgers = BTreeMap::new();
+    ledgers.insert(
+        CurrencyCode::usd(),
+        "0xa2000000000000000000000000000000000000a2".into(),
+    );
+    store
+        .upsert_entity(AccountOwner {
+            entity_id: "ent_slx_awx".into(),
+            legal_name: "SuperLexicon Pte. Ltd.".into(),
+            registration_number: "202600101A".into(),
+            functional_currency: CurrencyCode::usd(),
+            active: true,
+            chain_binding: Some(EntityChainBinding {
+                oracle_private_key_hex: "33".repeat(32),
+                chain_id: 1337,
+                wire_format: TxWireFormat::SuperLexiconL1,
+                treasury_identity_hex: Some(
+                    "0x3000000000000000000000000000000000000030".into(),
+                ),
+                operating_bank_ledgers: ledgers,
+                ifrs_accounting_ledger_hex: Some(
+                    "0xb3000000000000000000000000000000000000b3".into(),
+                ),
+                reward_voucher_hfs_hex: None,
+                fx_to_usd_ppm: BTreeMap::new(),
+            }),
+        })
+        .unwrap();
+
+    let awx_usd_acct = BankAccount {
+        account_id: "acct_slx_awx_usd".into(),
+        owner_entity_id: "ent_slx_awx".into(),
+        bank_adapter_id: "airwallex_bank".into(),
+        bank_bic: "AIRWSGSG".into(),
+        external_account_number: "ga_usd_slx_001".into(),
+        currency: CurrencyCode::usd(),
+        display_name: "SuperLexicon Airwallex USD Global Account".into(),
+        poll_enabled: true,
+        poll_interval_secs: 60,
+    };
+    store.upsert_bank_account(awx_usd_acct.clone()).unwrap();
+
+    let awx_usd_merchant = MerchantProfile {
+        merchant_profile_id: "mch_slx_awx_usd".into(),
+        owner_entity_id: "ent_slx_awx".into(),
+        acquirer_adapter_id: "airwallex".into(),
+        external_merchant_id: "acct_slx_awx_live".into(),
+        settlement_bank_account_id: "acct_slx_awx_usd".into(),
+        settlement_currency: CurrencyCode::usd(),
+        accepted_currencies: vec![CurrencyCode::usd(), CurrencyCode::eur(), CurrencyCode::sgd()],
+        poll_enabled: true,
+        poll_interval_secs: 60,
+    };
+    store
+        .upsert_merchant_profile(awx_usd_merchant.clone())
+        .unwrap();
+
+    let auth_cfg = AirwallexAuthConfig {
+        base_url: "https://api-demo.airwallex.com".into(),
+        client_id: "awx_cid_live".into(),
+        api_key: "awx_key_live".into(),
+        default_on_behalf_of: None,
+        webhook_secret: "whsec_awx_test_99".into(),
+        max_webhook_skew_secs: 300,
+    };
+    let shared_token_mgr = Arc::new(AirwallexTokenManager::new(
+        auth_cfg.clone(),
+        transport.clone(),
+    ));
+    let awx_bank = Arc::new(AirwallexBankAdapter::new(
+        AirwallexBankConfig {
+            adapter_id: "airwallex_bank".into(),
+            auth: auth_cfg.clone(),
+        },
+        shared_token_mgr.clone(),
+        transport.clone(),
+    ));
+    let awx_acq = Arc::new(AirwallexAcquirerAdapter::new(
+        AirwallexAcquirerConfig {
+            acquirer_id: "airwallex".into(),
+            default_account_id: "acct_slx_awx_live".into(),
+            auth: auth_cfg.clone(),
+        },
+        shared_token_mgr,
+        transport.clone(),
+    ));
+
+    let mut bank_map: HashMap<String, Arc<dyn BankTechnicalAdapter>> = HashMap::new();
+    bank_map.insert("airwallex_bank".into(), awx_bank.clone());
+    let mut acq_map: HashMap<String, Arc<dyn PaymentAcquirerAdapter>> = HashMap::new();
+    acq_map.insert("airwallex".into(), awx_acq.clone());
+
+    let engine = Arc::new(ReconciliationEngine::new(
+        store.clone(),
+        b"awx-domain-salt".to_vec(),
+    ));
+    let poller = Arc::new(PollingSupervisor::new(
+        engine.clone(),
+        Arc::new(bank_map.clone()),
+        Arc::new(acq_map.clone()),
+    ));
+    let relayer = Arc::new(ChainOutboxRelayer::new(
+        store.clone(),
+        transport.clone(),
+        "http://mock.slx.rpc:8545".into(),
+    ));
+    let router = build_oracle_router(Arc::new(OracleApiState {
+        engine: engine.clone(),
+        poller,
+        relayer,
+        bank_adapters: Arc::new(bank_map),
+        acquirer_adapters: Arc::new(acq_map),
+        ocbc_token_vault: Arc::new(OcbcTokenVault::new(store.clone(), None)),
+        ocbc_base_url: "https://api.ocbc.com".into(),
+        ocbc_client_id: "unused".into(),
+        ocbc_redirect_uri: "https://unused/cb".into(),
+        admin_bearer_token: "adm_awx_secret".into(),
+    }));
+
+    // 1. Queue ONE Airwallex OAuth login response — proves token caching across create + capture + cancel + transfer!
+    transport.enqueue_json(
+        "/api/v1/authentication/login",
+        200,
+        json!({
+            "token": "eyJ_awx_cached_bearer_30m",
+            "expires_at": "2099-01-01T00:00:00+0000"
+        }),
+    );
+
+    // 2. Backer #1 places a $500.00 USD pre-order hold (`AuthorizeOnly`, `auto_capture: false`)
+    transport.enqueue_json(
+        "/api/v1/pa/payment_intents/create",
+        201,
+        json!({
+            "id": "int_awx_backer_1",
+            "amount": 500.00,
+            "currency": "USD",
+            "merchant_order_id": "CF-INV-9001",
+            "status": "REQUIRES_CAPTURE",
+            "client_secret": "cs_int_awx_backer_1_secret",
+            "metadata": {
+                "order_ref": "CF-INV-9001",
+                "invoice_id": "9001"
+            }
+        }),
+    );
+    let sess1 = awx_acq
+        .create_payment_session(
+            &awx_usd_merchant,
+            &MerchantPaymentRequest {
+                order_reference: "CF-INV-9001".into(),
+                customer_id: Some("cus_foreign_us_01".into()),
+                amount: Money::new(50_000, CurrencyCode::usd()),
+                description: "SuperLexicon Mesh Validator Pre-Order".into(),
+                capture_mode: CardCaptureMode::AuthorizeOnly,
+                acquirer_specific_payload: json!({}),
+                success_url: Some("https://superlexicon.com/crowdfunding.html".into()),
+                cancel_url: None,
+                structured_invoice_id: Some(9001),
+                voucher_metadata: None,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sess1.acquirer_payment_id, "int_awx_backer_1");
+    engine
+        .ingest_acquirer_event(sess1.immediate_event.unwrap(), now)
+        .unwrap();
+    assert_eq!(
+        store.read(|s| s.clearing_items["airwallex:mch_slx_awx_usd:int_awx_backer_1"]
+            .status
+            .clone()),
+        ClearingItemStatus::AuthorizedOnly
+    );
+
+    // 3. Crowdfunding Board Resolution passes & target unlocks -> capture `int_awx_backer_1` ($500.00 USD)!
+    transport.enqueue_json(
+        "/api/v1/pa/payment_intents/int_awx_backer_1/capture",
+        200,
+        json!({
+            "id": "int_awx_backer_1",
+            "amount": 500.00,
+            "captured_amount": 500.00,
+            "currency": "USD",
+            "base_currency": "USD",
+            "merchant_order_id": "CF-INV-9001",
+            "status": "SUCCEEDED",
+            "metadata": {
+                "order_ref": "CF-INV-9001",
+                "invoice_id": "9001"
+            }
+        }),
+    );
+    let cap_ev = awx_acq
+        .capture_authorized_payment(
+            &awx_usd_merchant,
+            "int_awx_backer_1",
+            "CF-INV-9001",
+            &Money::new(50_000, CurrencyCode::usd()),
+            now + 10,
+        )
+        .await
+        .unwrap();
+    engine.ingest_acquirer_event(cap_ev, now + 10).unwrap();
+    assert_eq!(
+        store.read(|s| s.clearing_items["airwallex:mch_slx_awx_usd:int_awx_backer_1"]
+            .status
+            .clone()),
+        ClearingItemStatus::CapturedPendingBankSweep
+    );
+
+    // 4. Backer #2 pays $300.00 USD via foreign Mastercard (`payment_intent.succeeded` webhook with Airwallex ms HMAC)
+    let sign_awx = |ts_ms: u64, body: &[u8]| -> String {
+        let mut pre = ts_ms.to_string().into_bytes();
+        pre.extend_from_slice(body);
+        hex::encode(hmac_sha256(b"whsec_awx_test_99", &pre))
+    };
+    let ts_ms = now * 1000;
+    let pi2_webhook = serde_json::to_vec(&json!({
+        "id": "evt_awx_pi2",
+        "name": "payment_intent.succeeded",
+        "account_id": "acct_slx_awx_live",
+        "data": {
+            "object": {
+                "id": "int_awx_backer_2",
+                "amount": 300.00,
+                "captured_amount": 300.00,
+                "currency": "USD",
+                "settlement_currency": "USD",
+                "merchant_order_id": "CF-INV-9002",
+                "status": "SUCCEEDED",
+                "metadata": {
+                    "order_ref": "CF-INV-9002",
+                    "invoice_id": "9002"
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let resp_wh1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/webhooks/acquirers/airwallex")
+                .header("content-type", "application/json")
+                .header("x-timestamp", ts_ms.to_string())
+                .header("x-signature", sign_awx(ts_ms, &pi2_webhook))
+                .body(Body::from(pi2_webhook))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_wh1.status(), StatusCode::OK);
+
+    // 5. Airwallex settles both USD card captures like-for-like into USD (`$800.00` gross - `$28.80` 3.6% fee = `$771.20` net):
+    //    `settlement.settled` webhook + `deposit.settled` webhook on `airwallex_bank`!
+    transport.enqueue_json(
+        "/api/v1/pa/financial/settlements/stl_awx_usd_01/report",
+        200,
+        json!({
+            "items": [
+                {
+                    "type": "PAYMENT",
+                    "payment_intent_id": "int_awx_backer_1",
+                    "settlement_amount": 500.00,
+                    "fee": 18.00
+                },
+                {
+                    "type": "PAYMENT",
+                    "payment_intent_id": "int_awx_backer_2",
+                    "settlement_amount": 300.00,
+                    "fee": 10.80
+                }
+            ]
+        }),
+    );
+    let stl_webhook = serde_json::to_vec(&json!({
+        "id": "evt_awx_stl1",
+        "name": "settlement.settled",
+        "account_id": "acct_slx_awx_live",
+        "data": {
+            "object": {
+                "id": "stl_awx_usd_01",
+                "currency": "USD",
+                "amount": 771.20,
+                "reference": "AWX-USD-STL-20261126",
+                "settled_at": "2026-11-26T10:00:00+0000"
+            }
+        }
+    }))
+    .unwrap();
+    let resp_wh2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/webhooks/acquirers/airwallex")
+                .header("content-type", "application/json")
+                .header("x-timestamp", ts_ms.to_string())
+                .header("x-signature", sign_awx(ts_ms, &stl_webhook))
+                .body(Body::from(stl_webhook))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_wh2.status(), StatusCode::OK);
+
+    // Matching Airwallex USD wallet credit (`deposit.settled`, `0%` forced FX conversion!)
+    let dep_webhook = serde_json::to_vec(&json!({
+        "id": "evt_awx_dep1",
+        "name": "deposit.settled",
+        "data": {
+            "object": {
+                "id": "dep_awx_usd_77120",
+                "status": "SETTLED",
+                "global_account_id": "ga_usd_slx_001",
+                "currency": "USD",
+                "settled_amount": 771.20,
+                "source_type": "PA_SETTLEMENT",
+                "settlement_batch_id": "AWX-USD-STL-20261126",
+                "reference": "AWX-USD-STL-20261126",
+                "settled_at": "2026-11-26T10:05:00+0000"
+            }
+        }
+    }))
+    .unwrap();
+    let resp_wh3 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/webhooks/banks/airwallex_bank")
+                .header("content-type", "application/json")
+                .header("x-timestamp", ts_ms.to_string())
+                .header("x-signature", sign_awx(ts_ms, &dep_webhook))
+                .body(Body::from(dep_webhook))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_wh3.status(), StatusCode::OK);
+
+    assert!(matches!(
+        store.read(|s| s.sweep_batches["airwallex:mch_slx_awx_usd:stl_awx_usd_01"]
+            .status
+            .clone()),
+        SweepBatchStatus::ReconciledWithBankCredit { .. }
+    ));
+    assert!(matches!(
+        store.read(|s| s.clearing_items["airwallex:mch_slx_awx_usd:int_awx_backer_1"]
+            .status
+            .clone()),
+        ClearingItemStatus::BankCashFinalized { .. }
+    ));
+    assert!(matches!(
+        store.read(|s| s.clearing_items["airwallex:mch_slx_awx_usd:int_awx_backer_2"]
+            .status
+            .clone()),
+        ClearingItemStatus::BankCashFinalized { .. }
+    ));
+
+    // 6. Pay a USD PCB/component supplier `$200.00` directly out of the Airwallex USD Global Account!
+    transport.enqueue_json(
+        "/api/v1/transfers/create",
+        201,
+        json!({
+            "id": "tfr_awx_pcb_01",
+            "short_reference_id": "AWXTFR8801",
+            "status": "NEW",
+            "transfer_date": "2026-11-26"
+        }),
+    );
+    let sub_rcpt = awx_bank
+        .initiate_outbound_payment(
+            &awx_usd_acct,
+            &OutboundPaymentInstruction {
+                client_instruction_id: "PO-PCB-2026-01".into(),
+                counterparty_id: Some("bene_shenzhen_pcb_usd".into()),
+                beneficiary_name: "Shenzhen RF Circuits Ltd".into(),
+                beneficiary_account: "8800112233".into(),
+                beneficiary_bank_bic: Some("CMBCCNBS".into()),
+                beneficiary_bank_name: None,
+                beneficiary_address: None,
+                value_date: Some("2026-11-26".into()),
+                rail: TransferRail::Fedwire,
+                amount: Money::new(20_000, CurrencyCode::usd()),
+                remittance_info: "PO-PCB-2026-01".into(),
+            },
+            now + 20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub_rcpt.bank_payment_id.as_deref(), Some("tfr_awx_pcb_01"));
+    engine
+        .record_outbound_initiated(
+            &awx_usd_acct.account_id,
+            &OutboundPaymentInstruction {
+                client_instruction_id: "PO-PCB-2026-01".into(),
+                counterparty_id: Some("bene_shenzhen_pcb_usd".into()),
+                beneficiary_name: "Shenzhen RF Circuits Ltd".into(),
+                beneficiary_account: "8800112233".into(),
+                beneficiary_bank_bic: Some("CMBCCNBS".into()),
+                beneficiary_bank_name: None,
+                beneficiary_address: None,
+                value_date: Some("2026-11-26".into()),
+                rail: TransferRail::Fedwire,
+                amount: Money::new(20_000, CurrencyCode::usd()),
+                remittance_info: "PO-PCB-2026-01".into(),
+            },
+            &sub_rcpt,
+            now + 20,
+        )
+        .unwrap();
+
+    let tfr_webhook = serde_json::to_vec(&json!({
+        "id": "evt_awx_tfr1",
+        "name": "transfer.paid",
+        "data": {
+            "object": {
+                "id": "tfr_awx_pcb_01",
+                "status": "PAID",
+                "source_currency": "USD",
+                "source_amount": 200.00,
+                "fee_amount": 0.00,
+                "reference": "PO-PCB-2026-01",
+                "metadata": {
+                    "client_instruction_id": "PO-PCB-2026-01",
+                    "external_account_number": "ga_usd_slx_001"
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let resp_wh4 = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/webhooks/banks/airwallex_bank")
+                .header("content-type", "application/json")
+                .header("x-timestamp", ts_ms.to_string())
+                .header("x-signature", sign_awx(ts_ms, &tfr_webhook))
+                .body(Body::from(tfr_webhook))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_wh4.status(), StatusCode::OK);
+
+    // Verify `/api/v1/authentication/login` was called ONLY ONCE across all 4 authenticated API requests!
+    let login_calls = transport
+        .recorded_requests()
+        .iter()
+        .filter(|r| r.url.contains("/api/v1/authentication/login"))
+        .count();
+    assert_eq!(login_calls, 1, "Airwallex 30-min Bearer token must be cached and reused");
+
+    assert_entity_trial_balance_zero_net(&store, "ent_slx_awx");
+    let tb = store.compute_entity_trial_balance("ent_slx_awx");
+    // Net Cash at Bank (1010 USD) = $771.20 settled sweep in - $200.00 PCB payout = $571.20 (`57_120` cents)!
+    assert_eq!(
+        tb[&CurrencyCode::usd()][&SubledgerAccountCode::CashAtBank1010]
+            .net_debit_minus_credit_minor,
+        57_120
+    );
+}

@@ -1,6 +1,22 @@
 # `banking-oracle` — Multi-Entity, Multi-Bank & Payment Acquiring Oracle
 
-Standalone, dependency-isolated Rust service connecting corporate commercial banking rails and merchant payment acquirers to SuperLexicon Haltproof Subroutines (`AssetLedger`, `AccountingLedger`, and `RewardVoucher`).
+Standalone, dependency-isolated Rust service connecting corporate commercial banking rails and merchant payment acquirers (**Airwallex**, **CONNECT2OCBC**, **ISO 20022**, and **Stripe**) to SuperLexicon Haltproof Subroutines (`AssetLedger`, `AccountingLedger`, and `RewardVoucher`).
+
+## Airwallex Global Accounts & Payment Acceptance (`airwallex_bank` + `airwallex`)
+
+1. **Shared OAuth Bearer Token Cache & Webhook Verifier (`src/adapters/airwallex_auth.rs`)**
+   - `POST https://api.airwallex.com/api/v1/authentication/login` (`x-client-id` + `x-api-key`) with 30-minute Bearer token caching and `x-on-behalf-of` multi-entity sub-account support.
+   - Verifies official Airwallex `x-timestamp` + `x-signature` (`HMAC-SHA256(webhook_secret, x_timestamp || raw_body)`) webhook headers with replay-window enforcement.
+
+2. **Global Payment Acceptance & Pre-Order Crowdfunding (`src/adapters/acquirers/airwallex.rs`)**
+   - `POST /api/v1/pa/payment_intents/create` (`auto_capture: true` for immediate sales, or `auto_capture: false` / `PaymentConsent` for hardware pre-order crowdfunding holds).
+   - `POST /api/v1/pa/payment_intents/{id}/capture` & `/cancel` (capture when a Board-Resolution crowdfunding target unlocks, or cancel with zero charge if unmet).
+   - `GET /api/v1/pa/financial/settlements` + `/report` with **like-for-like multi-currency settlement** (`USD` foreign cards settling into an Airwallex `USD` Global Account with `0%` forced FX conversion).
+
+3. **Multi-Currency Global Accounts, Deposits & Transfers (`src/adapters/banks/airwallex_global.rs`)**
+   - `GET /api/v1/deposits` (`SGD` `FAST`/`PayNow`, `USD` `ACH`/`Fedwire`, `EUR` `SEPA`, and card settlement sweeps).
+   - `POST /api/v1/transfers/create` & `GET /api/v1/transfers/{id}` (automated domestic `FAST` and cross-border `LOCAL`/`SWIFT` supplier payouts).
+   - `POST /api/v1/deposits/create` (`DIRECT_DEBIT` pull collections).
 
 ## Official CONNECT2OCBC Endpoints Implemented (7 APIs)
 

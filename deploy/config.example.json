@@ -6,6 +6,29 @@
   "admin_bearer_token": "replace-with-high-entropy-admin-token",
   "poll_interval_secs": 30,
   "outbox_flush_interval_secs": 5,
+  "airwallex_bank": {
+    "adapter_id": "airwallex_bank",
+    "auth": {
+      "base_url": "https://api.airwallex.com",
+      "client_id": "AIRWALLEX_CLIENT_ID",
+      "api_key": "AIRWALLEX_API_KEY",
+      "default_on_behalf_of": null,
+      "webhook_secret": "AIRWALLEX_WEBHOOK_SECRET",
+      "max_webhook_skew_secs": 300
+    }
+  },
+  "airwallex": {
+    "acquirer_id": "airwallex",
+    "default_account_id": "acct_superlexicon_sg",
+    "auth": {
+      "base_url": "https://api.airwallex.com",
+      "client_id": "AIRWALLEX_CLIENT_ID",
+      "api_key": "AIRWALLEX_API_KEY",
+      "default_on_behalf_of": null,
+      "webhook_secret": "AIRWALLEX_WEBHOOK_SECRET",
+      "max_webhook_skew_secs": 300
+    }
+  },
   "ocbc_corporate": {
     "adapter_id": "ocbc_corporate",
     "base_url": "https://api.ocbc.com",
@@ -69,6 +92,28 @@
   ],
   "bootstrap_bank_accounts": [
     {
+      "account_id": "acct_slx_awx_usd",
+      "owner_entity_id": "ent_superlexicon_sg",
+      "bank_adapter_id": "airwallex_bank",
+      "bank_bic": "AIRWSGSG",
+      "external_account_number": "ga_usd_superlexicon_001",
+      "currency": "USD",
+      "display_name": "SuperLexicon Airwallex USD Global Account",
+      "poll_enabled": true,
+      "poll_interval_secs": 60
+    },
+    {
+      "account_id": "acct_slx_awx_sgd",
+      "owner_entity_id": "ent_superlexicon_sg",
+      "bank_adapter_id": "airwallex_bank",
+      "bank_bic": "AIRWSGSG",
+      "external_account_number": "ga_sgd_superlexicon_001",
+      "currency": "SGD",
+      "display_name": "SuperLexicon Airwallex SGD FAST/PayNow Global Account",
+      "poll_enabled": true,
+      "poll_interval_secs": 60
+    },
+    {
       "account_id": "acct_slx_ocbc_sgd",
       "owner_entity_id": "ent_superlexicon_sg",
       "bank_adapter_id": "ocbc_corporate",
@@ -92,6 +137,17 @@
     }
   ],
   "bootstrap_merchant_profiles": [
+    {
+      "merchant_profile_id": "mch_slx_airwallex_usd",
+      "owner_entity_id": "ent_superlexicon_sg",
+      "acquirer_adapter_id": "airwallex",
+      "external_merchant_id": "acct_superlexicon_sg",
+      "settlement_bank_account_id": "acct_slx_awx_usd",
+      "settlement_currency": "USD",
+      "accepted_currencies": ["USD", "EUR", "GBP", "SGD"],
+      "poll_enabled": true,
+      "poll_interval_secs": 120
+    },
     {
       "merchant_profile_id": "mch_slx_ocbc_card",
       "owner_entity_id": "ent_superlexicon_sg",
